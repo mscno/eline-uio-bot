@@ -80,6 +80,10 @@ pub struct Config {
     /// Example: --email-from "UiOBot <notifications@yourdomain.com>"
     #[arg(long, env = "UIOBOT_EMAIL_FROM")]
     pub email_from: Option<String>,
+
+    /// Web server port (only used in start mode)
+    #[arg(long, env = "UIOBOT_PORT", default_value = "3000")]
+    pub port: u16,
 }
 
 impl Cli {
@@ -430,6 +434,7 @@ mod tests {
             verbose: false,
             email_to: Some("a@b.com, c@d.com, e@f.com".to_string()),
             email_from: None,
+            port: 3000,
         };
 
         let recipients = config.email_recipients();
@@ -512,6 +517,7 @@ mod tests {
             verbose: false,
             email_to: None,
             email_from: None,
+            port: 3000,
         };
 
         let filter = config.points_filter();

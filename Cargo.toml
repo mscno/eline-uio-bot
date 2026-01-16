@@ -40,5 +40,8 @@ async-trait = "0.1"
 # Environment variables
 dotenvy = "0.15"
 
+# Web server
+axum = "0.8"
+
 # Pin home to avoid edition2024 requirement (transitive dep)
 home = "=0.5.9"

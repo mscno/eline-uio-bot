@@ -4,6 +4,7 @@ mod db;
 mod diff;
 mod models;
 mod notifier;
+mod web;
 
 use std::env;
 use std::process::ExitCode;
@@ -89,6 +90,18 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     let db = open_database(&config).await?;
     let filter = config.points_filter();
     let notifiers = build_notifiers(&config)?;
+    let port = config.port;
+
+    // Start web server in background
+    let web_router = web::create_router(db);
+    tokio::spawn(async move {
+        if let Err(e) = web::start_server(web_router, port).await {
+            error!(error = %e, "Web server failed");
+        }
+    });
+
+    // Re-open database for scrape loop (web server took ownership)
+    let db = open_database(&config).await?;
 
     let mut ticker = interval(Duration::from_secs(interval_secs));
 
@@ -96,6 +109,7 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
         interval_secs = interval_secs,
         notifier_count = notifiers.len(),
         db_type = %db.db_type(),
+        port = port,
         "Entering scrape loop (Ctrl+C to stop)"
     );
 

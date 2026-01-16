@@ -481,6 +481,108 @@ impl Database {
         Ok(run_id)
     }
 
+    /// Get all courses for web display, sorted by code
+    pub async fn get_courses_for_display(&self) -> Result<Vec<CourseDisplay>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT code, name, points, url, faculty, first_seen_at, last_seen_at
+                 FROM courses ORDER BY code",
+                (),
+            )
+            .await?;
+
+        let mut courses = Vec::new();
+        while let Some(row) = rows.next().await? {
+            courses.push(CourseDisplay {
+                code: row.get::<String>(0)?,
+                name: row.get::<String>(1)?,
+                points: row.get::<f64>(2)? as f32,
+                url: row.get::<String>(3)?,
+                faculty: row.get::<String>(4)?,
+                first_seen_at: row.get::<String>(5)?,
+                last_seen_at: row.get::<String>(6)?,
+            });
+        }
+
+        Ok(courses)
+    }
+
+    /// Get recent run logs for web display
+    pub async fn get_run_logs(&self, limit: usize) -> Result<Vec<RunLogEntry>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, timestamp, total_courses_fetched, raw_added_count, raw_removed_count,
+                        filtered_added_count, filtered_removed_count, filter_used,
+                        notification_sent, is_first_run, added_courses, removed_courses, duration_ms
+                 FROM run_log ORDER BY id DESC LIMIT ?",
+                libsql::params![limit as i64],
+            )
+            .await?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let added_json: String = row.get(10)?;
+            let removed_json: String = row.get(11)?;
+
+            entries.push(RunLogEntry {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                total_courses_fetched: row.get(2)?,
+                raw_added_count: row.get(3)?,
+                raw_removed_count: row.get(4)?,
+                filtered_added_count: row.get(5)?,
+                filtered_removed_count: row.get(6)?,
+                filter_used: row.get(7)?,
+                notification_sent: row.get::<i64>(8)? != 0,
+                is_first_run: row.get::<i64>(9)? != 0,
+                added_courses: serde_json::from_str(&added_json).unwrap_or_default(),
+                removed_courses: serde_json::from_str(&removed_json).unwrap_or_default(),
+                duration_ms: row.get(12)?,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Get a single run log by ID
+    pub async fn get_run_log(&self, id: i64) -> Result<Option<RunLogEntry>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, timestamp, total_courses_fetched, raw_added_count, raw_removed_count,
+                        filtered_added_count, filtered_removed_count, filter_used,
+                        notification_sent, is_first_run, added_courses, removed_courses, duration_ms
+                 FROM run_log WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let added_json: String = row.get(10)?;
+            let removed_json: String = row.get(11)?;
+
+            Ok(Some(RunLogEntry {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                total_courses_fetched: row.get(2)?,
+                raw_added_count: row.get(3)?,
+                raw_removed_count: row.get(4)?,
+                filtered_added_count: row.get(5)?,
+                filtered_removed_count: row.get(6)?,
+                filter_used: row.get(7)?,
+                notification_sent: row.get::<i64>(8)? != 0,
+                is_first_run: row.get::<i64>(9)? != 0,
+                added_courses: serde_json::from_str(&added_json).unwrap_or_default(),
+                removed_courses: serde_json::from_str(&removed_json).unwrap_or_default(),
+                duration_ms: row.get(12)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[instrument(skip(self, current_courses), fields(incoming_courses = current_courses.len()))]
     pub async fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
         let now = Utc::now();
@@ -605,6 +707,36 @@ pub struct RunLog {
     pub added_courses: Vec<String>,  // Course codes
     pub removed_courses: Vec<String>, // Course codes
     pub duration_ms: u64,
+}
+
+/// Course data for web display
+#[derive(Debug, Clone)]
+pub struct CourseDisplay {
+    pub code: String,
+    pub name: String,
+    pub points: f32,
+    pub faculty: String,
+    pub url: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+}
+
+/// Run log entry for web display
+#[derive(Debug, Clone)]
+pub struct RunLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub total_courses_fetched: i64,
+    pub raw_added_count: i64,
+    pub raw_removed_count: i64,
+    pub filtered_added_count: i64,
+    pub filtered_removed_count: i64,
+    pub filter_used: String,
+    pub notification_sent: bool,
+    pub is_first_run: bool,
+    pub added_courses: Vec<String>,
+    pub removed_courses: Vec<String>,
+    pub duration_ms: i64,
 }
 
 #[cfg(test)]
