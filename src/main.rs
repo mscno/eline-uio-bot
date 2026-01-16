@@ -55,7 +55,7 @@ async fn run_check(config: Config) -> Result<()> {
     log_config(&config);
 
     let scraper = CourseScraper::new(config.url.clone());
-    let db = Database::open(&config.db)?;
+    let db = open_database(&config).await?;
     let filter = config.points_filter();
     let notifiers = build_notifiers(&config)?;
 
@@ -86,7 +86,7 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     );
 
     let scraper = CourseScraper::new(config.url.clone());
-    let db = Database::open(&config.db)?;
+    let db = open_database(&config).await?;
     let filter = config.points_filter();
     let notifiers = build_notifiers(&config)?;
 
@@ -95,6 +95,7 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     info!(
         interval_secs = interval_secs,
         notifier_count = notifiers.len(),
+        db_type = %db.db_type(),
         "Entering scrape loop (Ctrl+C to stop)"
     );
 
@@ -112,6 +113,30 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     }
 }
 
+/// Open database based on configuration (local SQLite or Turso)
+async fn open_database(config: &Config) -> Result<Database> {
+    if let Some(ref db_url) = config.database_url {
+        let auth_token = config
+            .database_auth_token
+            .as_ref()
+            .context("DATABASE_AUTH_TOKEN is required when using DATABASE_URL")?;
+
+        info!(
+            db_url = %db_url,
+            "Using Turso remote database"
+        );
+
+        Database::open_turso(db_url, auth_token).await
+    } else {
+        info!(
+            db_path = %config.db.display(),
+            "Using local SQLite database"
+        );
+
+        Database::open(&config.db).await
+    }
+}
+
 fn init_logging(verbose: bool) {
     let log_level = if verbose { Level::DEBUG } else { Level::INFO };
     let subscriber = FmtSubscriber::builder()
@@ -122,12 +147,24 @@ fn init_logging(verbose: bool) {
 }
 
 fn log_config(config: &Config) {
-    info!(
-        url = %config.url,
-        db_path = %config.db.display(),
-        filter = %config.points_filter().description(),
-        "Core configuration"
-    );
+    // Log database configuration
+    if config.uses_turso() {
+        info!(
+            url = %config.url,
+            db_type = "turso",
+            db_url = %config.database_url.as_deref().unwrap_or("not set"),
+            filter = %config.points_filter().description(),
+            "Core configuration"
+        );
+    } else {
+        info!(
+            url = %config.url,
+            db_type = "sqlite",
+            db_path = %config.db.display(),
+            filter = %config.points_filter().description(),
+            "Core configuration"
+        );
+    }
 
     if config.email_enabled() {
         let recipients = config.email_recipients();
@@ -203,6 +240,7 @@ async fn run_scrape_cycle(
     info!(
         cycle_number = cycle_number,
         filter = %filter.description(),
+        db_type = %db.db_type(),
         "Starting scrape cycle"
     );
 
@@ -231,7 +269,7 @@ async fn run_scrape_cycle(
 
     // Sync with database
     let sync_start = Instant::now();
-    let sync_result = db.sync_courses(&courses)?;
+    let sync_result = db.sync_courses(&courses).await?;
 
     info!(
         cycle_number = cycle_number,

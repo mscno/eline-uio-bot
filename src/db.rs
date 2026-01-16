@@ -1,184 +1,365 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use libsql::{Builder, Connection};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::models::{Course, CourseChange};
 
+const SCHEMA_VERSION: i32 = 1;
+
 pub struct Database {
     conn: Connection,
+    db_type: DatabaseType,
+}
+
+#[derive(Debug, Clone)]
+pub enum DatabaseType {
+    LocalSqlite(String),
+    Turso { url: String },
+}
+
+impl std::fmt::Display for DatabaseType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseType::LocalSqlite(path) => write!(f, "SQLite({})", path),
+            DatabaseType::Turso { url } => write!(f, "Turso({})", url),
+        }
+    }
 }
 
 impl Database {
-    pub fn open(path: &Path) -> Result<Self> {
-        info!(db_path = %path.display(), "Opening database");
-        let conn = Connection::open(path).context("Failed to open database")?;
-        let db = Self { conn };
-        db.init_schema()?;
-        let count = db.get_course_count().unwrap_or(0);
+    /// Open a local SQLite database file
+    pub async fn open(path: &Path) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        info!(db_path = %path_str, db_type = "sqlite", "Opening local SQLite database");
+
+        let db = Builder::new_local(path)
+            .build()
+            .await
+            .context("Failed to open local SQLite database")?;
+
+        let conn = db.connect().context("Failed to connect to database")?;
+        let mut db = Self {
+            conn,
+            db_type: DatabaseType::LocalSqlite(path_str.clone()),
+        };
+
+        db.run_migrations().await?;
+
+        let count = db.get_course_count().await.unwrap_or(0);
         info!(
-            db_path = %path.display(),
+            db_path = %path_str,
+            db_type = "sqlite",
             existing_courses = count,
+            schema_version = SCHEMA_VERSION,
             "Database opened successfully"
         );
+
         Ok(db)
     }
 
-    pub fn open_in_memory() -> Result<Self> {
+    /// Open a remote Turso database
+    pub async fn open_turso(url: &str, auth_token: &str) -> Result<Self> {
+        info!(
+            db_url = %url,
+            db_type = "turso",
+            "Connecting to Turso database"
+        );
+
+        let db = Builder::new_remote(url.to_string(), auth_token.to_string())
+            .build()
+            .await
+            .context("Failed to connect to Turso database")?;
+
+        let conn = db.connect().context("Failed to connect to Turso")?;
+        let mut db = Self {
+            conn,
+            db_type: DatabaseType::Turso { url: url.to_string() },
+        };
+
+        db.run_migrations().await?;
+
+        let count = db.get_course_count().await.unwrap_or(0);
+        info!(
+            db_url = %url,
+            db_type = "turso",
+            existing_courses = count,
+            schema_version = SCHEMA_VERSION,
+            "Turso database connected successfully"
+        );
+
+        Ok(db)
+    }
+
+    /// Open an in-memory database for testing
+    pub async fn open_in_memory() -> Result<Self> {
         debug!("Opening in-memory database");
-        let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
-        let db = Self { conn };
-        db.init_schema()?;
+
+        let db = Builder::new_local(":memory:")
+            .build()
+            .await
+            .context("Failed to open in-memory database")?;
+
+        let conn = db.connect().context("Failed to connect to in-memory database")?;
+        let mut db = Self {
+            conn,
+            db_type: DatabaseType::LocalSqlite(":memory:".to_string()),
+        };
+
+        db.run_migrations().await?;
         debug!("In-memory database opened successfully");
+
         Ok(db)
     }
 
-    fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS courses (
-                code TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                points REAL NOT NULL,
-                url TEXT NOT NULL,
-                faculty TEXT NOT NULL,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL
-            );
+    /// Get the database type description
+    pub fn db_type(&self) -> &DatabaseType {
+        &self.db_type
+    }
 
-            CREATE TABLE IF NOT EXISTS change_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                course_code TEXT NOT NULL,
-                change_type TEXT NOT NULL,
-                course_data TEXT NOT NULL,
-                timestamp TEXT NOT NULL
-            );
+    /// Run database migrations
+    async fn run_migrations(&mut self) -> Result<()> {
+        info!(target_version = SCHEMA_VERSION, "Running database migrations");
 
-            CREATE INDEX IF NOT EXISTS idx_change_log_timestamp
-                ON change_log(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_change_log_course_code
-                ON change_log(course_code);
-            "#,
-        )?;
+        // Create schema version table if it doesn't exist
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY
+                )",
+                (),
+            )
+            .await?;
 
-        debug!("Database schema initialized");
+        // Get current version
+        let current_version: i32 = self
+            .conn
+            .query("SELECT COALESCE(MAX(version), 0) FROM schema_version", ())
+            .await?
+            .next()
+            .await?
+            .map(|row| row.get::<i32>(0).unwrap_or(0))
+            .unwrap_or(0);
+
+        debug!(
+            current_version = current_version,
+            target_version = SCHEMA_VERSION,
+            "Migration status"
+        );
+
+        if current_version < 1 {
+            info!(migration = 1, "Running migration: create initial schema");
+            self.migrate_v1().await?;
+        }
+
+        // Add future migrations here as needed:
+        // if current_version < 2 {
+        //     self.migrate_v2().await?;
+        // }
+
+        info!(
+            from_version = current_version,
+            to_version = SCHEMA_VERSION,
+            "Migrations completed"
+        );
+
         Ok(())
     }
 
-    pub fn get_all_courses(&self) -> Result<HashMap<String, Course>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT code, name, points, url, faculty FROM courses",
-        )?;
+    /// Migration v1: Create initial tables
+    async fn migrate_v1(&mut self) -> Result<()> {
+        // Create courses table
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS courses (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    points REAL NOT NULL,
+                    url TEXT NOT NULL,
+                    faculty TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                )",
+                (),
+            )
+            .await?;
 
-        let courses = stmt
-            .query_map([], |row| {
-                Ok(Course {
-                    code: row.get(0)?,
-                    name: row.get(1)?,
-                    points: row.get(2)?,
-                    url: row.get(3)?,
-                    faculty: row.get(4)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .map(|c| (c.code.clone(), c))
-            .collect();
+        // Create change log table
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS change_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    course_code TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    course_data TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )",
+                (),
+            )
+            .await?;
+
+        // Create indexes
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_change_log_timestamp ON change_log(timestamp)",
+                (),
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_change_log_course_code ON change_log(course_code)",
+                (),
+            )
+            .await?;
+
+        // Record migration version
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (1)", ())
+            .await?;
+
+        debug!("Migration v1 completed: initial schema created");
+        Ok(())
+    }
+
+    pub async fn get_all_courses(&self) -> Result<HashMap<String, Course>> {
+        let mut rows = self
+            .conn
+            .query("SELECT code, name, points, url, faculty FROM courses", ())
+            .await?;
+
+        let mut courses = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let course = Course {
+                code: row.get::<String>(0)?,
+                name: row.get::<String>(1)?,
+                points: row.get::<f64>(2)? as f32,
+                url: row.get::<String>(3)?,
+                faculty: row.get::<String>(4)?,
+            };
+            courses.insert(course.code.clone(), course);
+        }
 
         Ok(courses)
     }
 
-    pub fn get_course_count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM courses", [], |row| row.get(0))?;
+    pub async fn get_course_count(&self) -> Result<usize> {
+        let mut rows = self.conn.query("SELECT COUNT(*) FROM courses", ()).await?;
+        let count = rows
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0).unwrap_or(0))
+            .unwrap_or(0);
         Ok(count as usize)
     }
 
-    pub fn is_first_run(&self) -> Result<bool> {
-        Ok(self.get_course_count()? == 0)
+    pub async fn is_first_run(&self) -> Result<bool> {
+        Ok(self.get_course_count().await? == 0)
     }
 
-    pub fn upsert_course(&self, course: &Course, now: DateTime<Utc>) -> Result<bool> {
+    pub async fn upsert_course(&self, course: &Course, now: DateTime<Utc>) -> Result<bool> {
         let now_str = now.to_rfc3339();
 
         // Check if course exists
-        let exists: bool = self.conn.query_row(
-            "SELECT 1 FROM courses WHERE code = ?",
-            [&course.code],
-            |_| Ok(true),
-        ).unwrap_or(false);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM courses WHERE code = ?",
+                libsql::params![course.code.clone()],
+            )
+            .await?;
+
+        let exists = rows.next().await?.is_some();
 
         if exists {
-            // Update last_seen_at
-            self.conn.execute(
-                "UPDATE courses SET
-                    name = ?, points = ?, url = ?, faculty = ?, last_seen_at = ?
-                 WHERE code = ?",
-                params![
-                    course.name,
-                    course.points,
-                    course.url,
-                    course.faculty,
-                    now_str,
-                    course.code,
-                ],
-            )?;
+            // Update existing course
+            self.conn
+                .execute(
+                    "UPDATE courses SET name = ?, points = ?, url = ?, faculty = ?, last_seen_at = ? WHERE code = ?",
+                    libsql::params![
+                        course.name.clone(),
+                        course.points as f64,
+                        course.url.clone(),
+                        course.faculty.clone(),
+                        now_str.clone(),
+                        course.code.clone(),
+                    ],
+                )
+                .await?;
             Ok(false) // Not new
         } else {
             // Insert new course
-            self.conn.execute(
-                "INSERT INTO courses (code, name, points, url, faculty, first_seen_at, last_seen_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    course.code,
-                    course.name,
-                    course.points,
-                    course.url,
-                    course.faculty,
-                    now_str,
-                    now_str,
-                ],
-            )?;
+            self.conn
+                .execute(
+                    "INSERT INTO courses (code, name, points, url, faculty, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        course.code.clone(),
+                        course.name.clone(),
+                        course.points as f64,
+                        course.url.clone(),
+                        course.faculty.clone(),
+                        now_str.clone(),
+                        now_str.clone(),
+                    ],
+                )
+                .await?;
             Ok(true) // New course
         }
     }
 
-    pub fn remove_course(&self, code: &str) -> Result<Option<Course>> {
+    pub async fn remove_course(&self, code: &str) -> Result<Option<Course>> {
         // Get course before removing
-        let course = self.conn.query_row(
-            "SELECT code, name, points, url, faculty FROM courses WHERE code = ?",
-            [code],
-            |row| {
-                Ok(Course {
-                    code: row.get(0)?,
-                    name: row.get(1)?,
-                    points: row.get(2)?,
-                    url: row.get(3)?,
-                    faculty: row.get(4)?,
-                })
-            },
-        ).ok();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT code, name, points, url, faculty FROM courses WHERE code = ?",
+                libsql::params![code.to_string()],
+            )
+            .await?;
+
+        let course = if let Some(row) = rows.next().await? {
+            Some(Course {
+                code: row.get::<String>(0)?,
+                name: row.get::<String>(1)?,
+                points: row.get::<f64>(2)? as f32,
+                url: row.get::<String>(3)?,
+                faculty: row.get::<String>(4)?,
+            })
+        } else {
+            None
+        };
 
         if course.is_some() {
-            self.conn.execute("DELETE FROM courses WHERE code = ?", [code])?;
+            self.conn
+                .execute(
+                    "DELETE FROM courses WHERE code = ?",
+                    libsql::params![code.to_string()],
+                )
+                .await?;
         }
 
         Ok(course)
     }
 
-    pub fn log_change(&self, change: &CourseChange) -> Result<()> {
+    pub async fn log_change(&self, change: &CourseChange) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let course = change.course();
         let change_type = change.change_type();
         let course_json = serde_json::to_string(course)?;
 
-        self.conn.execute(
-            "INSERT INTO change_log (course_code, change_type, course_data, timestamp)
-             VALUES (?, ?, ?, ?)",
-            params![course.code, change_type, course_json, now],
-        )?;
+        self.conn
+            .execute(
+                "INSERT INTO change_log (course_code, change_type, course_data, timestamp) VALUES (?, ?, ?, ?)",
+                libsql::params![
+                    course.code.clone(),
+                    change_type.to_string(),
+                    course_json,
+                    now.clone(),
+                ],
+            )
+            .await?;
 
         info!(
             course_code = %course.code,
@@ -188,26 +369,27 @@ impl Database {
             timestamp = %now,
             "Change logged to database"
         );
+
         Ok(())
     }
 
     #[instrument(skip(self, current_courses), fields(incoming_courses = current_courses.len()))]
-    pub fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
+    pub async fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
         let now = Utc::now();
-        let is_first_run = self.is_first_run()?;
+        let is_first_run = self.is_first_run().await?;
 
         // Get existing courses
-        let existing = self.get_all_courses()?;
+        let existing = self.get_all_courses().await?;
         let existing_count = existing.len();
         let current_codes: std::collections::HashSet<_> =
             current_courses.iter().map(|c| c.code.clone()).collect();
-        let existing_codes: std::collections::HashSet<_> =
-            existing.keys().cloned().collect();
+        let existing_codes: std::collections::HashSet<_> = existing.keys().cloned().collect();
 
         info!(
             is_first_run = is_first_run,
             existing_courses_in_db = existing_count,
             incoming_courses = current_courses.len(),
+            db_type = %self.db_type,
             "Starting database sync"
         );
 
@@ -217,7 +399,7 @@ impl Database {
 
         // Find new courses
         for course in current_courses {
-            let is_new = self.upsert_course(course, now)?;
+            let is_new = self.upsert_course(course, now).await?;
             if is_new {
                 if !is_first_run {
                     debug!(
@@ -228,7 +410,7 @@ impl Database {
                         "New course detected"
                     );
                     added.push(course.clone());
-                    self.log_change(&CourseChange::Added(course.clone()))?;
+                    self.log_change(&CourseChange::Added(course.clone())).await?;
                 }
             } else {
                 updated_count += 1;
@@ -244,7 +426,7 @@ impl Database {
         );
 
         for code in codes_to_remove {
-            if let Some(course) = self.remove_course(&code)? {
+            if let Some(course) = self.remove_course(&code).await? {
                 if !is_first_run {
                     debug!(
                         course_code = %course.code,
@@ -253,7 +435,7 @@ impl Database {
                         faculty = %course.faculty,
                         "Course removed from availability"
                     );
-                    self.log_change(&CourseChange::Removed(course.clone()))?;
+                    self.log_change(&CourseChange::Removed(course.clone())).await?;
                     removed.push(course);
                 }
             }
@@ -262,6 +444,7 @@ impl Database {
         if is_first_run {
             info!(
                 courses_stored = current_courses.len(),
+                db_type = %self.db_type,
                 "First run completed - database initialized"
             );
         } else {
@@ -272,6 +455,7 @@ impl Database {
                 total_courses = current_courses.len(),
                 added_codes = ?added.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
                 removed_codes = ?removed.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+                db_type = %self.db_type,
                 "Database sync completed"
             );
         }
@@ -323,23 +507,23 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_upsert_course() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_upsert_course() {
+        let db = Database::open_in_memory().await.unwrap();
         let course = test_course();
 
         // First insert should return true (new)
-        let is_new = db.upsert_course(&course, Utc::now()).unwrap();
+        let is_new = db.upsert_course(&course, Utc::now()).await.unwrap();
         assert!(is_new);
 
         // Second insert should return false (existing)
-        let is_new = db.upsert_course(&course, Utc::now()).unwrap();
+        let is_new = db.upsert_course(&course, Utc::now()).await.unwrap();
         assert!(!is_new);
     }
 
-    #[test]
-    fn test_sync_courses() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_sync_courses() {
+        let db = Database::open_in_memory().await.unwrap();
         let course1 = test_course();
         let course2 = Course::new(
             "IN2000".to_string(),
@@ -350,22 +534,22 @@ mod tests {
         );
 
         // First sync - first run
-        let result = db.sync_courses(&[course1.clone(), course2.clone()]).unwrap();
+        let result = db.sync_courses(&[course1.clone(), course2.clone()]).await.unwrap();
         assert!(result.is_first_run);
         assert!(result.added.is_empty()); // First run doesn't report added
         assert_eq!(result.total_courses, 2);
 
         // Second sync - remove course2
-        let result = db.sync_courses(&[course1.clone()]).unwrap();
+        let result = db.sync_courses(&[course1.clone()]).await.unwrap();
         assert!(!result.is_first_run);
         assert!(result.added.is_empty());
         assert_eq!(result.removed.len(), 1);
         assert_eq!(result.removed[0].code, "IN2000");
     }
 
-    #[test]
-    fn test_sync_detects_added_and_removed_by_code() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_sync_detects_added_and_removed_by_code() {
+        let db = Database::open_in_memory().await.unwrap();
 
         // Initial courses: A (2.5 pts), B (10 pts), C (2.5 pts)
         let course_a = make_course("HFLESER1031", 2.5); // 2.5 point course
@@ -373,13 +557,19 @@ mod tests {
         let course_c = make_course("HIS2011M", 2.5); // Another 2.5 point course
 
         // First sync - populates DB
-        let result = db.sync_courses(&[course_a.clone(), course_b.clone(), course_c.clone()]).unwrap();
+        let result = db
+            .sync_courses(&[course_a.clone(), course_b.clone(), course_c.clone()])
+            .await
+            .unwrap();
         assert!(result.is_first_run);
-        assert_eq!(db.get_course_count().unwrap(), 3);
+        assert_eq!(db.get_course_count().await.unwrap(), 3);
 
         // Second sync - course_a (2.5pts) removed, new course_d (2.5pts) added
         let course_d = make_course("NEWCOURSE", 2.5); // New 2.5 point course
-        let result = db.sync_courses(&[course_b.clone(), course_c.clone(), course_d.clone()]).unwrap();
+        let result = db
+            .sync_courses(&[course_b.clone(), course_c.clone(), course_d.clone()])
+            .await
+            .unwrap();
 
         assert!(!result.is_first_run);
 
@@ -394,17 +584,17 @@ mod tests {
         assert_eq!(result.removed[0].points, 2.5);
 
         // Verify DB state: should have B, C, D
-        assert_eq!(db.get_course_count().unwrap(), 3);
-        let all_courses = db.get_all_courses().unwrap();
+        assert_eq!(db.get_course_count().await.unwrap(), 3);
+        let all_courses = db.get_all_courses().await.unwrap();
         assert!(all_courses.contains_key("IN1000"));
         assert!(all_courses.contains_key("HIS2011M"));
         assert!(all_courses.contains_key("NEWCOURSE"));
         assert!(!all_courses.contains_key("HFLESER1031")); // Removed
     }
 
-    #[test]
-    fn test_course_code_is_unique_identifier() {
-        let db = Database::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_course_code_is_unique_identifier() {
+        let db = Database::open_in_memory().await.unwrap();
 
         // Two courses with same code but different names/points
         let course_v1 = Course::new(
@@ -418,24 +608,24 @@ mod tests {
         let course_v2 = Course::new(
             "TEST123".to_string(), // Same code
             "Updated Name".to_string(), // Different name
-            10.0, // Different points
+            10.0,                  // Different points
             "https://example.com/test".to_string(),
             "Faculty".to_string(),
         );
 
         // Insert first version
-        let is_new = db.upsert_course(&course_v1, Utc::now()).unwrap();
+        let is_new = db.upsert_course(&course_v1, Utc::now()).await.unwrap();
         assert!(is_new);
 
         // Insert second version with same code - should update, not create new
-        let is_new = db.upsert_course(&course_v2, Utc::now()).unwrap();
+        let is_new = db.upsert_course(&course_v2, Utc::now()).await.unwrap();
         assert!(!is_new); // Not new because code already exists
 
         // Should still have only 1 course
-        assert_eq!(db.get_course_count().unwrap(), 1);
+        assert_eq!(db.get_course_count().await.unwrap(), 1);
 
         // Course should have updated values
-        let courses = db.get_all_courses().unwrap();
+        let courses = db.get_all_courses().await.unwrap();
         let course = courses.get("TEST123").unwrap();
         assert_eq!(course.name, "Updated Name");
         assert_eq!(course.points, 10.0);

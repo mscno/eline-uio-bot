@@ -37,9 +37,18 @@ pub struct Config {
     #[arg(short, long, default_value = DEFAULT_URL)]
     pub url: String,
 
-    /// Database file path
+    /// Database file path (for local SQLite, ignored if --database-url is set)
     #[arg(short, long, default_value = "uiobot.db")]
     pub db: PathBuf,
+
+    /// Turso/LibSQL database URL (e.g., libsql://your-db.turso.io)
+    /// When set, uses remote database instead of local SQLite file
+    #[arg(long, env = "DATABASE_URL")]
+    pub database_url: Option<String>,
+
+    /// Turso/LibSQL authentication token (required when using --database-url)
+    #[arg(long, env = "DATABASE_AUTH_TOKEN")]
+    pub database_auth_token: Option<String>,
 
     /// Filter: exact points value (e.g., 2.5)
     #[arg(long, value_name = "POINTS")]
@@ -93,6 +102,11 @@ impl Config {
         self.email_to.is_some() && !self.email_recipients().is_empty()
     }
 
+    /// Check if using Turso/remote database
+    pub fn uses_turso(&self) -> bool {
+        self.database_url.is_some()
+    }
+
     /// Validate the configuration and return errors if invalid
     pub fn validate(&self) -> Result<()> {
         // Validate URL
@@ -101,6 +115,27 @@ impl Config {
                 "Invalid URL '{}': must start with http:// or https://",
                 self.url
             );
+        }
+
+        // Validate database configuration
+        if let Some(ref db_url) = self.database_url {
+            // Validate database URL format
+            if !db_url.starts_with("libsql://") && !db_url.starts_with("https://") {
+                bail!(
+                    "Invalid database URL '{}': must start with libsql:// or https://\n\
+                     Example: libsql://your-database.turso.io",
+                    db_url
+                );
+            }
+
+            // Require auth token for remote databases
+            if self.database_auth_token.is_none() {
+                bail!(
+                    "Turso database URL requires --database-auth-token to be set.\n\
+                     Set it via CLI flag or DATABASE_AUTH_TOKEN environment variable.\n\
+                     You can get your token from: turso db tokens create <database-name>"
+                );
+            }
         }
 
         // Validate points filter
@@ -296,6 +331,8 @@ mod tests {
         let config = Config {
             url: "https://example.com".to_string(),
             db: PathBuf::from("test.db"),
+            database_url: None,
+            database_auth_token: None,
             points_exact: None,
             points_max: None,
             points_min: None,
