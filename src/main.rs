@@ -19,7 +19,8 @@ use config::{validate_interval, Cli, Command, Config, PointsFilter};
 use course_scraper::CourseScraper;
 use db::{Database, RunLog};
 use diff::filter_changes;
-use notifier::{ConsoleNotifier, EmailNotifier, NotifierChain};
+use models::{Course, ScrapeDiff};
+use notifier::{ConsoleNotifier, EmailNotifier, Notifier, NotifierChain};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,6 +32,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Check { config } => run_check(config).await,
         Command::Start { config, interval } => run_start(config, interval).await,
+        Command::TestEmail { to, from } => run_test_email(to, from).await,
     };
 
     match result {
@@ -125,6 +127,72 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
             );
         }
     }
+}
+
+async fn run_test_email(to: String, from: String) -> Result<()> {
+    // Initialize minimal logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    // Get API key from environment
+    let api_key = env::var("RESEND_API_KEY").context(
+        "RESEND_API_KEY environment variable not set.\n\
+         Get an API key from https://resend.com and set it in your .env file.",
+    )?;
+
+    // Parse recipients
+    let recipients: Vec<String> = to
+        .split(',')
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    if recipients.is_empty() {
+        anyhow::bail!("No valid email recipients provided");
+    }
+
+    info!(
+        from = %from,
+        to = ?recipients,
+        "Sending test email notification"
+    );
+
+    // Create sample courses for demo
+    let demo_diff = ScrapeDiff::new(
+        vec![
+            Course::new(
+                "TEST1000".to_string(),
+                "Introduction to Test Notifications".to_string(),
+                2.5,
+                "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+                "Test Faculty".to_string(),
+            ),
+            Course::new(
+                "TEST2000".to_string(),
+                "Advanced Email Testing".to_string(),
+                5.0,
+                "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+                "Test Faculty".to_string(),
+            ),
+        ],
+        vec![Course::new(
+            "OLD1000".to_string(),
+            "Previously Available Course".to_string(),
+            10.0,
+            "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+            "Test Faculty".to_string(),
+        )],
+    );
+
+    // Send the test email
+    let notifier = EmailNotifier::new(api_key, from, recipients);
+    notifier.notify(&demo_diff).await?;
+
+    info!("Test email sent successfully!");
+    Ok(())
 }
 
 /// Open database based on configuration (local SQLite or Turso)

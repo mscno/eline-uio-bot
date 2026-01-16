@@ -29,6 +29,16 @@ pub enum Command {
         #[arg(short, long, default_value = "60")]
         interval: u64,
     },
+    /// Send a test email notification to verify email configuration
+    TestEmail {
+        /// Email addresses to send to (comma-separated)
+        #[arg(short, long, env = "UIOBOT_EMAIL_TO", required = true)]
+        to: String,
+
+        /// Email address to send from (must be verified domain in Resend)
+        #[arg(short, long, env = "UIOBOT_EMAIL_FROM", required = true)]
+        from: String,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
