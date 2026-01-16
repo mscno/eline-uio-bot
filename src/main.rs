@@ -16,7 +16,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use config::{validate_interval, Cli, Command, Config, PointsFilter};
 use course_scraper::CourseScraper;
-use db::Database;
+use db::{Database, RunLog};
 use diff::filter_changes;
 use notifier::{ConsoleNotifier, EmailNotifier, NotifierChain};
 
@@ -281,6 +281,12 @@ async fn run_scrape_cycle(
         "Sync phase completed"
     );
 
+    // Apply filter (even on first run, to track what would have been notified)
+    let filtered_diff = filter_changes(&sync_result, filter);
+
+    // Prepare notification tracking
+    let mut notification_sent = false;
+
     if sync_result.is_first_run {
         info!(
             cycle_number = cycle_number,
@@ -288,86 +294,110 @@ async fn run_scrape_cycle(
             total_duration_ms = cycle_start.elapsed().as_millis(),
             "First run completed - database initialized, no notifications sent"
         );
-        return Ok(());
-    }
-
-    if !sync_result.has_changes() {
+    } else if !sync_result.has_changes() {
         info!(
             cycle_number = cycle_number,
             total_courses = sync_result.total_courses,
             total_duration_ms = cycle_start.elapsed().as_millis(),
             "No changes detected"
         );
-        return Ok(());
-    }
-
-    debug!(
-        cycle_number = cycle_number,
-        added_courses = ?sync_result.added.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
-        removed_courses = ?sync_result.removed.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
-        "Raw changes before filtering"
-    );
-
-    // Apply filter
-    let filtered_diff = filter_changes(&sync_result, filter);
-
-    if filtered_diff.is_empty() {
-        info!(
+    } else {
+        debug!(
             cycle_number = cycle_number,
-            filter = %filter.description(),
-            raw_added = sync_result.added.len(),
-            raw_removed = sync_result.removed.len(),
-            total_duration_ms = cycle_start.elapsed().as_millis(),
-            "No changes match filter criteria - no notifications sent"
+            added_courses = ?sync_result.added.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+            removed_courses = ?sync_result.removed.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+            "Raw changes before filtering"
         );
-        return Ok(());
-    }
 
-    info!(
-        cycle_number = cycle_number,
-        filtered_added = filtered_diff.added.len(),
-        filtered_removed = filtered_diff.removed.len(),
-        filter = %filter.description(),
-        "Changes passed filter - sending notifications"
-    );
+        if filtered_diff.is_empty() {
+            info!(
+                cycle_number = cycle_number,
+                filter = %filter.description(),
+                raw_added = sync_result.added.len(),
+                raw_removed = sync_result.removed.len(),
+                total_duration_ms = cycle_start.elapsed().as_millis(),
+                "No changes match filter criteria - no notifications sent"
+            );
+        } else {
+            info!(
+                cycle_number = cycle_number,
+                filtered_added = filtered_diff.added.len(),
+                filtered_removed = filtered_diff.removed.len(),
+                filter = %filter.description(),
+                "Changes passed filter - sending notifications"
+            );
 
-    // Send notifications
-    let notify_start = Instant::now();
-    let results = notifiers.notify_all(&filtered_diff).await;
+            // Send notifications
+            let notify_start = Instant::now();
+            let results = notifiers.notify_all(&filtered_diff).await;
 
-    let mut success_count = 0;
-    let mut failure_count = 0;
+            let mut success_count = 0;
+            let mut failure_count = 0;
 
-    for (name, result) in &results {
-        match result {
-            Ok(_) => {
-                success_count += 1;
-                info!(
-                    cycle_number = cycle_number,
-                    notifier = %name,
-                    added_count = filtered_diff.added.len(),
-                    removed_count = filtered_diff.removed.len(),
-                    "Notification sent successfully"
-                );
+            for (name, result) in &results {
+                match result {
+                    Ok(_) => {
+                        success_count += 1;
+                        info!(
+                            cycle_number = cycle_number,
+                            notifier = %name,
+                            added_count = filtered_diff.added.len(),
+                            removed_count = filtered_diff.removed.len(),
+                            "Notification sent successfully"
+                        );
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        warn!(
+                            cycle_number = cycle_number,
+                            notifier = %name,
+                            error = %e,
+                            "Notification failed"
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                failure_count += 1;
-                warn!(
-                    cycle_number = cycle_number,
-                    notifier = %name,
-                    error = %e,
-                    "Notification failed"
-                );
-            }
+
+            // Consider notification sent if at least one succeeded
+            notification_sent = success_count > 0;
+
+            info!(
+                cycle_number = cycle_number,
+                notify_duration_ms = notify_start.elapsed().as_millis(),
+                notifiers_success = success_count,
+                notifiers_failed = failure_count,
+                "Notification phase completed"
+            );
         }
     }
 
+    // Log this run to the database
+    let run_log = RunLog {
+        total_courses_fetched: courses.len(),
+        raw_added_count: sync_result.added.len(),
+        raw_removed_count: sync_result.removed.len(),
+        filtered_added_count: filtered_diff.added.len(),
+        filtered_removed_count: filtered_diff.removed.len(),
+        filter_used: filter.description(),
+        notification_sent,
+        is_first_run: sync_result.is_first_run,
+        added_courses: filtered_diff.added.iter().map(|c| c.code.clone()).collect(),
+        removed_courses: filtered_diff.removed.iter().map(|c| c.code.clone()).collect(),
+        duration_ms: cycle_start.elapsed().as_millis() as u64,
+    };
+
+    if let Err(e) = db.log_run(&run_log).await {
+        warn!(
+            cycle_number = cycle_number,
+            error = %e,
+            "Failed to log run to database"
+        );
+    }
+
     info!(
         cycle_number = cycle_number,
-        notify_duration_ms = notify_start.elapsed().as_millis(),
         total_duration_ms = cycle_start.elapsed().as_millis(),
-        notifiers_success = success_count,
-        notifiers_failed = failure_count,
+        notification_sent = notification_sent,
         changes_added = filtered_diff.added.len(),
         changes_removed = filtered_diff.removed.len(),
         "Scrape cycle completed"

@@ -51,16 +51,21 @@ pub struct Config {
     pub database_auth_token: Option<String>,
 
     /// Filter: exact points value (e.g., 2.5)
-    #[arg(long, value_name = "POINTS")]
+    #[arg(long, env = "UIOBOT_POINTS_EXACT", value_name = "POINTS")]
     pub points_exact: Option<f32>,
 
     /// Filter: maximum points (inclusive)
-    #[arg(long, value_name = "POINTS")]
+    #[arg(long, env = "UIOBOT_POINTS_MAX", value_name = "POINTS")]
     pub points_max: Option<f32>,
 
     /// Filter: minimum points (inclusive)
-    #[arg(long, value_name = "POINTS")]
+    #[arg(long, env = "UIOBOT_POINTS_MIN", value_name = "POINTS")]
     pub points_min: Option<f32>,
+
+    /// Filter: points filter expression (alternative to individual flags)
+    /// Formats: "2.5" (exact), ">=5" (min), "<=10" (max), "5-10" (range)
+    #[arg(long, env = "UIOBOT_POINTS_FILTER", value_name = "FILTER")]
+    pub points_filter_expr: Option<String>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -195,6 +200,14 @@ impl Config {
     }
 
     pub fn points_filter(&self) -> PointsFilter {
+        // First check if points_filter_expr is set (takes precedence)
+        if let Some(ref expr) = self.points_filter_expr {
+            if let Some(filter) = parse_points_filter_expr(expr) {
+                return filter;
+            }
+        }
+
+        // Fall back to individual flags
         if let Some(exact) = self.points_exact {
             PointsFilter::Exact(exact)
         } else if self.points_min.is_some() || self.points_max.is_some() {
@@ -206,6 +219,83 @@ impl Config {
             PointsFilter::None
         }
     }
+}
+
+/// Parse a points filter expression string
+/// Formats:
+/// - "2.5" -> exact match
+/// - ">=5" or "5+" -> minimum
+/// - "<=10" or "10-" -> maximum
+/// - "5-10" -> range (min-max)
+fn parse_points_filter_expr(expr: &str) -> Option<PointsFilter> {
+    let expr = expr.trim();
+
+    if expr.is_empty() {
+        return Some(PointsFilter::None);
+    }
+
+    // Range format: "5-10" or "5.0-10.0"
+    if let Some(dash_pos) = expr.find('-') {
+        // Make sure it's not just a negative number or suffix like "10-"
+        if dash_pos > 0 && dash_pos < expr.len() - 1 {
+            let left = expr[..dash_pos].trim();
+            let right = expr[dash_pos + 1..].trim();
+
+            if let (Ok(min), Ok(max)) = (left.parse::<f32>(), right.parse::<f32>()) {
+                return Some(PointsFilter::Range {
+                    min: Some(min),
+                    max: Some(max),
+                });
+            }
+        }
+    }
+
+    // Minimum format: ">=5" or ">5"
+    if expr.starts_with(">=") {
+        if let Ok(min) = expr[2..].trim().parse::<f32>() {
+            return Some(PointsFilter::Range { min: Some(min), max: None });
+        }
+    }
+    if expr.starts_with('>') && !expr.starts_with(">=") {
+        if let Ok(min) = expr[1..].trim().parse::<f32>() {
+            // For ">5", we use 5.01 as a slight offset (not strictly greater, but close)
+            return Some(PointsFilter::Range { min: Some(min), max: None });
+        }
+    }
+
+    // Minimum format: "5+"
+    if expr.ends_with('+') {
+        if let Ok(min) = expr[..expr.len() - 1].trim().parse::<f32>() {
+            return Some(PointsFilter::Range { min: Some(min), max: None });
+        }
+    }
+
+    // Maximum format: "<=10" or "<10"
+    if expr.starts_with("<=") {
+        if let Ok(max) = expr[2..].trim().parse::<f32>() {
+            return Some(PointsFilter::Range { min: None, max: Some(max) });
+        }
+    }
+    if expr.starts_with('<') && !expr.starts_with("<=") {
+        if let Ok(max) = expr[1..].trim().parse::<f32>() {
+            return Some(PointsFilter::Range { min: None, max: Some(max) });
+        }
+    }
+
+    // Maximum format: "10-" (trailing dash)
+    if expr.ends_with('-') && expr.len() > 1 {
+        if let Ok(max) = expr[..expr.len() - 1].trim().parse::<f32>() {
+            return Some(PointsFilter::Range { min: None, max: Some(max) });
+        }
+    }
+
+    // Exact format: just a number
+    if let Ok(exact) = expr.parse::<f32>() {
+        return Some(PointsFilter::Exact(exact));
+    }
+
+    // Couldn't parse
+    None
 }
 
 /// Simple email validation (not RFC 5322 compliant but good enough)
@@ -336,6 +426,7 @@ mod tests {
             points_exact: None,
             points_max: None,
             points_min: None,
+            points_filter_expr: None,
             verbose: false,
             email_to: Some("a@b.com, c@d.com, e@f.com".to_string()),
             email_from: None,
@@ -346,5 +437,84 @@ mod tests {
         assert_eq!(recipients[0], "a@b.com");
         assert_eq!(recipients[1], "c@d.com");
         assert_eq!(recipients[2], "e@f.com");
+    }
+
+    #[test]
+    fn test_parse_points_filter_expr_exact() {
+        let filter = parse_points_filter_expr("2.5").unwrap();
+        assert!(matches!(filter, PointsFilter::Exact(v) if (v - 2.5).abs() < 0.01));
+
+        let filter = parse_points_filter_expr("10").unwrap();
+        assert!(matches!(filter, PointsFilter::Exact(v) if (v - 10.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn test_parse_points_filter_expr_min() {
+        let filter = parse_points_filter_expr(">=5").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: Some(v), max: None } if (v - 5.0).abs() < 0.01));
+
+        let filter = parse_points_filter_expr("5+").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: Some(v), max: None } if (v - 5.0).abs() < 0.01));
+
+        let filter = parse_points_filter_expr(">5").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: Some(v), max: None } if (v - 5.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn test_parse_points_filter_expr_max() {
+        let filter = parse_points_filter_expr("<=10").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: None, max: Some(v) } if (v - 10.0).abs() < 0.01));
+
+        let filter = parse_points_filter_expr("<10").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: None, max: Some(v) } if (v - 10.0).abs() < 0.01));
+
+        let filter = parse_points_filter_expr("10-").unwrap();
+        assert!(matches!(filter, PointsFilter::Range { min: None, max: Some(v) } if (v - 10.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn test_parse_points_filter_expr_range() {
+        let filter = parse_points_filter_expr("5-10").unwrap();
+        assert!(matches!(
+            filter,
+            PointsFilter::Range { min: Some(min), max: Some(max) }
+            if (min - 5.0).abs() < 0.01 && (max - 10.0).abs() < 0.01
+        ));
+
+        let filter = parse_points_filter_expr("2.5-7.5").unwrap();
+        assert!(matches!(
+            filter,
+            PointsFilter::Range { min: Some(min), max: Some(max) }
+            if (min - 2.5).abs() < 0.01 && (max - 7.5).abs() < 0.01
+        ));
+    }
+
+    #[test]
+    fn test_parse_points_filter_expr_empty() {
+        let filter = parse_points_filter_expr("").unwrap();
+        assert!(matches!(filter, PointsFilter::None));
+
+        let filter = parse_points_filter_expr("  ").unwrap();
+        assert!(matches!(filter, PointsFilter::None));
+    }
+
+    #[test]
+    fn test_points_filter_expr_takes_precedence() {
+        let config = Config {
+            url: "https://example.com".to_string(),
+            db: PathBuf::from("test.db"),
+            database_url: None,
+            database_auth_token: None,
+            points_exact: Some(10.0), // This should be ignored
+            points_max: None,
+            points_min: None,
+            points_filter_expr: Some("2.5".to_string()), // This takes precedence
+            verbose: false,
+            email_to: None,
+            email_from: None,
+        };
+
+        let filter = config.points_filter();
+        assert!(matches!(filter, PointsFilter::Exact(v) if (v - 2.5).abs() < 0.01));
     }
 }

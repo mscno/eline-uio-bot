@@ -7,7 +7,7 @@ use tracing::{debug, info, instrument};
 
 use crate::models::{Course, CourseChange};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub struct Database {
     conn: Connection,
@@ -154,10 +154,10 @@ impl Database {
             self.migrate_v1().await?;
         }
 
-        // Add future migrations here as needed:
-        // if current_version < 2 {
-        //     self.migrate_v2().await?;
-        // }
+        if current_version < 2 {
+            info!(migration = 2, "Running migration: create run_log table");
+            self.migrate_v2().await?;
+        }
 
         info!(
             from_version = current_version,
@@ -221,6 +221,47 @@ impl Database {
             .await?;
 
         debug!("Migration v1 completed: initial schema created");
+        Ok(())
+    }
+
+    /// Migration v2: Create run_log table for tracking deltas
+    async fn migrate_v2(&mut self) -> Result<()> {
+        // Create run_log table to track each scrape run and its results
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS run_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    total_courses_fetched INTEGER NOT NULL,
+                    raw_added_count INTEGER NOT NULL,
+                    raw_removed_count INTEGER NOT NULL,
+                    filtered_added_count INTEGER NOT NULL,
+                    filtered_removed_count INTEGER NOT NULL,
+                    filter_used TEXT NOT NULL,
+                    notification_sent INTEGER NOT NULL,
+                    is_first_run INTEGER NOT NULL,
+                    added_courses TEXT NOT NULL,
+                    removed_courses TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await?;
+
+        // Create index for timestamp queries
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_run_log_timestamp ON run_log(timestamp)",
+                (),
+            )
+            .await?;
+
+        // Record migration version
+        self.conn
+            .execute("INSERT INTO schema_version (version) VALUES (2)", ())
+            .await?;
+
+        debug!("Migration v2 completed: run_log table created");
         Ok(())
     }
 
@@ -373,6 +414,73 @@ impl Database {
         Ok(())
     }
 
+    /// Log a complete run with all delta information
+    #[instrument(skip(self, run_log), fields(
+        total_fetched = run_log.total_courses_fetched,
+        filtered_added = run_log.filtered_added_count,
+        filtered_removed = run_log.filtered_removed_count
+    ))]
+    pub async fn log_run(&self, run_log: &RunLog) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Serialize course code lists as JSON
+        let added_json = serde_json::to_string(&run_log.added_courses)?;
+        let removed_json = serde_json::to_string(&run_log.removed_courses)?;
+
+        self.conn
+            .execute(
+                "INSERT INTO run_log (
+                    timestamp, total_courses_fetched,
+                    raw_added_count, raw_removed_count,
+                    filtered_added_count, filtered_removed_count,
+                    filter_used, notification_sent, is_first_run,
+                    added_courses, removed_courses, duration_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    now.clone(),
+                    run_log.total_courses_fetched as i64,
+                    run_log.raw_added_count as i64,
+                    run_log.raw_removed_count as i64,
+                    run_log.filtered_added_count as i64,
+                    run_log.filtered_removed_count as i64,
+                    run_log.filter_used.clone(),
+                    if run_log.notification_sent { 1i64 } else { 0i64 },
+                    if run_log.is_first_run { 1i64 } else { 0i64 },
+                    added_json,
+                    removed_json,
+                    run_log.duration_ms as i64,
+                ],
+            )
+            .await?;
+
+        // Get the last inserted row ID
+        let mut rows = self.conn.query("SELECT last_insert_rowid()", ()).await?;
+        let run_id = rows
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0).unwrap_or(0))
+            .unwrap_or(0);
+
+        info!(
+            run_id = run_id,
+            timestamp = %now,
+            total_courses_fetched = run_log.total_courses_fetched,
+            raw_added = run_log.raw_added_count,
+            raw_removed = run_log.raw_removed_count,
+            filtered_added = run_log.filtered_added_count,
+            filtered_removed = run_log.filtered_removed_count,
+            filter = %run_log.filter_used,
+            notification_sent = run_log.notification_sent,
+            is_first_run = run_log.is_first_run,
+            added_codes = ?run_log.added_courses,
+            removed_codes = ?run_log.removed_courses,
+            duration_ms = run_log.duration_ms,
+            "Run logged to database"
+        );
+
+        Ok(run_id)
+    }
+
     #[instrument(skip(self, current_courses), fields(incoming_courses = current_courses.len()))]
     pub async fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
         let now = Utc::now();
@@ -481,6 +589,22 @@ impl SyncResult {
     pub fn has_changes(&self) -> bool {
         !self.added.is_empty() || !self.removed.is_empty()
     }
+}
+
+/// Record of a single scrape run for logging
+#[derive(Debug)]
+pub struct RunLog {
+    pub total_courses_fetched: usize,
+    pub raw_added_count: usize,
+    pub raw_removed_count: usize,
+    pub filtered_added_count: usize,
+    pub filtered_removed_count: usize,
+    pub filter_used: String,
+    pub notification_sent: bool,
+    pub is_first_run: bool,
+    pub added_courses: Vec<String>,  // Course codes
+    pub removed_courses: Vec<String>, // Course codes
+    pub duration_ms: u64,
 }
 
 #[cfg(test)]
