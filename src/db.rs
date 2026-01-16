@@ -537,8 +537,8 @@ impl Database {
                 filter_used: row.get(7)?,
                 notification_sent: row.get::<i64>(8)? != 0,
                 is_first_run: row.get::<i64>(9)? != 0,
-                added_courses: serde_json::from_str(&added_json).unwrap_or_default(),
-                removed_courses: serde_json::from_str(&removed_json).unwrap_or_default(),
+                added_courses: parse_courses_json(&added_json),
+                removed_courses: parse_courses_json(&removed_json),
                 duration_ms: row.get(12)?,
             });
         }
@@ -574,8 +574,8 @@ impl Database {
                 filter_used: row.get(7)?,
                 notification_sent: row.get::<i64>(8)? != 0,
                 is_first_run: row.get::<i64>(9)? != 0,
-                added_courses: serde_json::from_str(&added_json).unwrap_or_default(),
-                removed_courses: serde_json::from_str(&removed_json).unwrap_or_default(),
+                added_courses: parse_courses_json(&added_json),
+                removed_courses: parse_courses_json(&removed_json),
                 duration_ms: row.get(12)?,
             }))
         } else {
@@ -737,6 +737,30 @@ pub struct RunLogEntry {
     pub added_courses: Vec<Course>,
     pub removed_courses: Vec<Course>,
     pub duration_ms: i64,
+}
+
+/// Parse courses JSON, handling both old format (array of strings) and new format (array of Course objects)
+fn parse_courses_json(json: &str) -> Vec<Course> {
+    // Try parsing as Vec<Course> first (new format)
+    if let Ok(courses) = serde_json::from_str::<Vec<Course>>(json) {
+        return courses;
+    }
+
+    // Fall back to parsing as Vec<String> (old format) and convert to minimal Course objects
+    if let Ok(codes) = serde_json::from_str::<Vec<String>>(json) {
+        return codes
+            .into_iter()
+            .map(|code| Course::new(
+                code.clone(),
+                "(details not available)".to_string(),
+                0.0,
+                String::new(),
+                String::new(),
+            ))
+            .collect();
+    }
+
+    Vec::new()
 }
 
 #[cfg(test)]
