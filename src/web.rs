@@ -284,6 +284,7 @@ fn render_run_detail(run: &RunLogEntry) -> String {
         .lists h4 {{ margin-bottom: 0.5rem; }}
         .added {{ color: green; }}
         .removed {{ color: red; }}
+        .hint {{ color: #606c76; font-size: 0.85em; margin-top: 1rem; }}
     </style>
 </head>
 <body>
@@ -332,6 +333,7 @@ fn render_run_detail(run: &RunLogEntry) -> String {
                 <ul>{}</ul>
             </div>
         </div>
+        <p class="hint">Note: Course lists show raw changes. Older runs may have empty lists due to a previous bug.</p>
 
         <p><a href="/runs">&larr; Back to Run Logs</a></p>
     </main>
@@ -357,9 +359,9 @@ fn render_run_detail(run: &RunLogEntry) -> String {
         } else {
             "No"
         },
-        run.filtered_added_count,
+        run.raw_added_count,
         added_list,
-        run.filtered_removed_count,
+        run.raw_removed_count,
         removed_list,
     )
 }
