@@ -34,14 +34,14 @@ impl SmsNotifier {
         if !diff.added.is_empty() {
             message.push_str(&format!("\nNye ({}):\n", diff.added.len()));
             for course in &diff.added {
-                message.push_str(&format!("• {} - {}\n", course.code, course.name));
+                message.push_str(&format!("• {} - {} ({} stp)\n", course.code, course.name, course.points));
             }
         }
 
         if !diff.removed.is_empty() {
             message.push_str(&format!("\nFjernet ({}):\n", diff.removed.len()));
             for course in &diff.removed {
-                message.push_str(&format!("• {} - {}\n", course.code, course.name));
+                message.push_str(&format!("• {} - {} ({} stp)\n", course.code, course.name, course.points));
             }
         }
 
