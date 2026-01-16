@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{debug, info, instrument};
 
 use super::Notifier;
 use crate::models::{Course, ScrapeDiff};
@@ -25,10 +25,22 @@ impl Notifier for ConsoleNotifier {
         "console"
     }
 
+    #[instrument(skip(self, diff), fields(
+        notifier = "console",
+        added = diff.added.len(),
+        removed = diff.removed.len()
+    ))]
     async fn notify(&self, diff: &ScrapeDiff) -> Result<()> {
         if diff.is_empty() {
+            debug!("No changes to notify, skipping console output");
             return Ok(());
         }
+
+        debug!(
+            added_codes = ?diff.added.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            removed_codes = ?diff.removed.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            "Writing changes to console"
+        );
 
         println!("\n{}", "=".repeat(60));
         println!("COURSE AVAILABILITY CHANGES");
@@ -53,9 +65,11 @@ impl Notifier for ConsoleNotifier {
         println!("\n{}", "=".repeat(60));
 
         info!(
-            added = diff.added.len(),
-            removed = diff.removed.len(),
-            "Notification sent to console"
+            notifier = "console",
+            added_count = diff.added.len(),
+            removed_count = diff.removed.len(),
+            total_changes = diff.total_changes(),
+            "Console notification displayed"
         );
 
         Ok(())

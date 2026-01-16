@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use scraper::{ElementRef, Html, Selector};
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{debug, info, instrument, warn};
 
 use crate::models::Course;
 
@@ -16,11 +17,14 @@ impl CourseScraper {
             .build()
             .expect("Failed to create HTTP client");
 
+        info!(url = %url, "Scraper initialized");
         Self { client, url }
     }
 
+    #[instrument(skip(self), fields(url = %self.url))]
     pub async fn fetch_courses(&self) -> Result<Vec<Course>> {
-        debug!("Fetching courses from {}", self.url);
+        let start = Instant::now();
+        info!(url = %self.url, "Starting HTTP fetch");
 
         let response = self
             .client
@@ -30,14 +34,42 @@ impl CourseScraper {
             .context("Failed to fetch URL")?;
 
         let status = response.status();
+        let status_code = status.as_u16();
+
         if !status.is_success() {
+            warn!(
+                status_code = status_code,
+                status_text = %status,
+                url = %self.url,
+                "HTTP request failed"
+            );
             anyhow::bail!("HTTP error: {}", status);
         }
 
+        let content_length = response.content_length();
         let html = response.text().await.context("Failed to read response body")?;
-        debug!("Received {} bytes of HTML", html.len());
+        let fetch_duration_ms = start.elapsed().as_millis();
 
-        self.parse_courses(&html)
+        info!(
+            status_code = status_code,
+            content_length_header = ?content_length,
+            body_bytes = html.len(),
+            fetch_duration_ms = fetch_duration_ms,
+            "HTTP fetch completed"
+        );
+
+        let parse_start = Instant::now();
+        let courses = self.parse_courses(&html)?;
+        let parse_duration_ms = parse_start.elapsed().as_millis();
+
+        info!(
+            courses_parsed = courses.len(),
+            parse_duration_ms = parse_duration_ms,
+            total_duration_ms = start.elapsed().as_millis(),
+            "Fetch and parse completed"
+        );
+
+        Ok(courses)
     }
 
     fn parse_courses(&self, html: &str) -> Result<Vec<Course>> {
@@ -52,7 +84,7 @@ impl CourseScraper {
         let content_element = match content {
             Some(el) => el,
             None => {
-                warn!("Could not find main content area");
+                warn!("Could not find main content area in HTML document");
                 return Ok(courses);
             }
         };
@@ -68,20 +100,32 @@ impl CourseScraper {
             if let Some(id) = h2.value().attr("id") {
                 // Skip navigation-related h2s
                 if id.contains("sporsmal") || id.contains("kontakt") {
+                    debug!(h2_id = %id, "Skipping navigation h2 element");
                     continue;
                 }
                 let faculty_name = h2.text().collect::<String>().trim().to_string();
                 if !faculty_name.is_empty() {
-                    // Use a simple counter for ordering
+                    debug!(
+                        faculty_index = faculty_map.len(),
+                        faculty_name = %faculty_name,
+                        h2_id = %id,
+                        "Found faculty section"
+                    );
                     faculty_map.push((faculty_map.len(), faculty_name));
                 }
             }
         }
 
-        debug!("Found {} faculty sections", faculty_map.len());
+        info!(
+            faculty_count = faculty_map.len(),
+            faculties = ?faculty_map.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(),
+            "Identified faculty sections"
+        );
 
         // Now process tables - each table corresponds to a faculty in order
         let mut table_idx = 0;
+        let mut courses_by_faculty: Vec<(String, usize)> = Vec::new();
+
         for table in content_element.select(&table_selector) {
             let faculty = if table_idx < faculty_map.len() {
                 faculty_map[table_idx].1.clone()
@@ -91,13 +135,25 @@ impl CourseScraper {
 
             let table_courses = self.parse_table(table, &faculty);
             if !table_courses.is_empty() {
-                debug!("Parsed {} courses from {}", table_courses.len(), faculty);
+                debug!(
+                    faculty = %faculty,
+                    courses_in_table = table_courses.len(),
+                    table_index = table_idx,
+                    "Parsed faculty table"
+                );
+                courses_by_faculty.push((faculty.clone(), table_courses.len()));
                 courses.extend(table_courses);
                 table_idx += 1;
             }
         }
 
-        debug!("Parsed {} courses total", courses.len());
+        info!(
+            total_courses = courses.len(),
+            tables_processed = table_idx,
+            courses_by_faculty = ?courses_by_faculty,
+            "HTML parsing completed"
+        );
+
         Ok(courses)
     }
 
@@ -107,11 +163,17 @@ impl CourseScraper {
         let td_selector = Selector::parse("td").expect("Invalid td selector");
         let a_selector = Selector::parse("a").expect("Invalid a selector");
 
+        let mut rows_processed = 0;
+        let mut rows_skipped = 0;
+        let mut parse_errors = 0;
+
         for row in table.select(&tr_selector) {
             let tds: Vec<_> = row.select(&td_selector).collect();
             if tds.len() < 2 {
+                rows_skipped += 1;
                 continue;
             }
+            rows_processed += 1;
 
             // First td contains the link with course code and name
             let first_td = &tds[0];
@@ -130,6 +192,12 @@ impl CourseScraper {
             };
 
             if code.is_empty() {
+                debug!(
+                    faculty = %faculty,
+                    raw_text = %first_td.text().collect::<String>().trim(),
+                    "Skipping row with empty course code"
+                );
+                rows_skipped += 1;
                 continue;
             }
 
@@ -140,20 +208,39 @@ impl CourseScraper {
             if let Some(points) = points {
                 let course = Course::new(
                     code.clone(),
-                    name,
+                    name.clone(),
                     points,
-                    url,
+                    url.clone(),
                     faculty.to_string(),
                 );
                 debug!(
-                    "Parsed: {} ({} pts) - {}",
-                    course.code, course.points, faculty
+                    course_code = %code,
+                    course_name = %name,
+                    points = points,
+                    faculty = %faculty,
+                    has_url = !url.is_empty(),
+                    "Parsed course"
                 );
                 courses.push(course);
             } else {
-                warn!("Failed to parse points from: {}", points_text.trim());
+                warn!(
+                    course_code = %code,
+                    faculty = %faculty,
+                    raw_points_text = %points_text.trim(),
+                    "Failed to parse points value"
+                );
+                parse_errors += 1;
             }
         }
+
+        debug!(
+            faculty = %faculty,
+            courses_found = courses.len(),
+            rows_processed = rows_processed,
+            rows_skipped = rows_skipped,
+            parse_errors = parse_errors,
+            "Table parsing completed"
+        );
 
         courses
     }

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument, warn};
 
 use crate::models::{Course, CourseChange};
 
@@ -13,16 +13,25 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
+        info!(db_path = %path.display(), "Opening database");
         let conn = Connection::open(path).context("Failed to open database")?;
         let db = Self { conn };
         db.init_schema()?;
+        let count = db.get_course_count().unwrap_or(0);
+        info!(
+            db_path = %path.display(),
+            existing_courses = count,
+            "Database opened successfully"
+        );
         Ok(db)
     }
 
     pub fn open_in_memory() -> Result<Self> {
+        debug!("Opening in-memory database");
         let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
         let db = Self { conn };
         db.init_schema()?;
+        debug!("In-memory database opened successfully");
         Ok(db)
     }
 
@@ -171,37 +180,79 @@ impl Database {
             params![course.code, change_type, course_json, now],
         )?;
 
-        debug!("Logged change: {} {}", change_type, course.code);
+        info!(
+            course_code = %course.code,
+            course_name = %course.name,
+            points = course.points,
+            change_type = %change_type,
+            timestamp = %now,
+            "Change logged to database"
+        );
         Ok(())
     }
 
+    #[instrument(skip(self, current_courses), fields(incoming_courses = current_courses.len()))]
     pub fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
         let now = Utc::now();
         let is_first_run = self.is_first_run()?;
 
         // Get existing courses
         let existing = self.get_all_courses()?;
+        let existing_count = existing.len();
         let current_codes: std::collections::HashSet<_> =
             current_courses.iter().map(|c| c.code.clone()).collect();
         let existing_codes: std::collections::HashSet<_> =
             existing.keys().cloned().collect();
 
+        info!(
+            is_first_run = is_first_run,
+            existing_courses_in_db = existing_count,
+            incoming_courses = current_courses.len(),
+            "Starting database sync"
+        );
+
         let mut added = Vec::new();
         let mut removed = Vec::new();
+        let mut updated_count = 0;
 
         // Find new courses
         for course in current_courses {
             let is_new = self.upsert_course(course, now)?;
-            if is_new && !is_first_run {
-                added.push(course.clone());
-                self.log_change(&CourseChange::Added(course.clone()))?;
+            if is_new {
+                if !is_first_run {
+                    debug!(
+                        course_code = %course.code,
+                        course_name = %course.name,
+                        points = course.points,
+                        faculty = %course.faculty,
+                        "New course detected"
+                    );
+                    added.push(course.clone());
+                    self.log_change(&CourseChange::Added(course.clone()))?;
+                }
+            } else {
+                updated_count += 1;
             }
         }
 
         // Find removed courses
-        for code in existing_codes.difference(&current_codes) {
-            if let Some(course) = self.remove_course(code)? {
+        let codes_to_remove: Vec<_> = existing_codes.difference(&current_codes).cloned().collect();
+        debug!(
+            courses_to_remove = codes_to_remove.len(),
+            codes = ?codes_to_remove,
+            "Checking for removed courses"
+        );
+
+        for code in codes_to_remove {
+            if let Some(course) = self.remove_course(&code)? {
                 if !is_first_run {
+                    debug!(
+                        course_code = %course.code,
+                        course_name = %course.name,
+                        points = course.points,
+                        faculty = %course.faculty,
+                        "Course removed from availability"
+                    );
                     self.log_change(&CourseChange::Removed(course.clone()))?;
                     removed.push(course);
                 }
@@ -209,7 +260,20 @@ impl Database {
         }
 
         if is_first_run {
-            info!("First run: populated database with {} courses", current_courses.len());
+            info!(
+                courses_stored = current_courses.len(),
+                "First run completed - database initialized"
+            );
+        } else {
+            info!(
+                added_count = added.len(),
+                removed_count = removed.len(),
+                updated_count = updated_count,
+                total_courses = current_courses.len(),
+                added_codes = ?added.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+                removed_codes = ?removed.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+                "Database sync completed"
+            );
         }
 
         Ok(SyncResult {

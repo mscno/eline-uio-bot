@@ -7,11 +7,11 @@ mod notifier;
 
 use std::env;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::time::interval;
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use config::{validate_interval, Cli, Command, Config, PointsFilter};
@@ -47,13 +47,22 @@ async fn run_check(config: Config) -> Result<()> {
     // Validate configuration
     config.validate()?;
 
-    info!("Running single check");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        mode = "check",
+        "Running single check"
+    );
     log_config(&config);
 
     let scraper = CourseScraper::new(config.url.clone());
     let db = Database::open(&config.db)?;
     let filter = config.points_filter();
     let notifiers = build_notifiers(&config)?;
+
+    info!(
+        notifier_count = notifiers.len(),
+        "Configuration loaded, starting check"
+    );
 
     run_scrape_cycle(&scraper, &db, &filter, &notifiers).await
 }
@@ -65,9 +74,16 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     config.validate()?;
     validate_interval(interval_secs)?;
 
-    info!("Starting UiO Course Availability Bot");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "Starting UiO Course Availability Bot"
+    );
     log_config(&config);
-    info!("Interval: {} seconds", interval_secs);
+    info!(
+        interval_secs = interval_secs,
+        interval_human = format!("{}m {}s", interval_secs / 60, interval_secs % 60),
+        "Scrape interval configured"
+    );
 
     let scraper = CourseScraper::new(config.url.clone());
     let db = Database::open(&config.db)?;
@@ -76,13 +92,22 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
 
     let mut ticker = interval(Duration::from_secs(interval_secs));
 
-    info!("Starting scrape loop (Ctrl+C to stop)");
+    info!(
+        interval_secs = interval_secs,
+        notifier_count = notifiers.len(),
+        "Entering scrape loop (Ctrl+C to stop)"
+    );
 
     loop {
         ticker.tick().await;
 
+        debug!("Ticker fired, starting new cycle");
+
         if let Err(e) = run_scrape_cycle(&scraper, &db, &filter, &notifiers).await {
-            error!("Scrape cycle failed: {:#}", e);
+            error!(
+                error = %e,
+                "Scrape cycle failed - will retry next interval"
+            );
         }
     }
 }
@@ -97,21 +122,27 @@ fn init_logging(verbose: bool) {
 }
 
 fn log_config(config: &Config) {
-    info!("URL: {}", config.url);
-    info!("Database: {}", config.db.display());
-    info!("Filter: {}", config.points_filter().description());
+    info!(
+        url = %config.url,
+        db_path = %config.db.display(),
+        filter = %config.points_filter().description(),
+        "Core configuration"
+    );
 
     if config.email_enabled() {
         let recipients = config.email_recipients();
         info!(
-            "Email notifications: enabled ({} recipient{})",
-            recipients.len(),
-            if recipients.len() == 1 { "" } else { "s" }
+            email_enabled = true,
+            email_from = %config.email_from.as_deref().unwrap_or("not set"),
+            email_recipients = ?recipients,
+            recipient_count = recipients.len(),
+            "Email notification configuration"
         );
-        info!("  From: {}", config.email_from.as_deref().unwrap_or("not set"));
-        info!("  To: {}", recipients.join(", "));
     } else {
-        info!("Email notifications: disabled");
+        info!(
+            email_enabled = false,
+            "Email notifications disabled"
+        );
     }
 }
 
@@ -120,6 +151,7 @@ fn build_notifiers(config: &Config) -> Result<NotifierChain> {
 
     // Always add console notifier
     notifiers.add(ConsoleNotifier::new());
+    debug!(notifier = "console", "Added console notifier");
 
     // Add email notifier if configured
     if config.email_enabled() {
@@ -139,12 +171,21 @@ fn build_notifiers(config: &Config) -> Result<NotifierChain> {
         let recipients = config.email_recipients();
 
         info!(
-            "Email notifier configured: from='{}', to={:?}",
-            from, recipients
+            notifier = "email",
+            from = %from,
+            recipients = ?recipients,
+            recipient_count = recipients.len(),
+            api_key_prefix = %api_key.chars().take(10).collect::<String>(),
+            "Added email notifier"
         );
 
         notifiers.add(EmailNotifier::new(api_key, from, recipients));
     }
+
+    info!(
+        total_notifiers = notifiers.len(),
+        "Notifier chain built"
+    );
 
     Ok(notifiers)
 }
@@ -155,63 +196,144 @@ async fn run_scrape_cycle(
     filter: &PointsFilter,
     notifiers: &NotifierChain,
 ) -> Result<()> {
-    info!("Starting scrape cycle");
+    let cycle_start = Instant::now();
+    static CYCLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cycle_number = CYCLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+    info!(
+        cycle_number = cycle_number,
+        filter = %filter.description(),
+        "Starting scrape cycle"
+    );
 
     // Fetch courses
+    let fetch_start = Instant::now();
     let courses = match scraper.fetch_courses().await {
-        Ok(courses) => courses,
+        Ok(courses) => {
+            info!(
+                cycle_number = cycle_number,
+                courses_fetched = courses.len(),
+                fetch_duration_ms = fetch_start.elapsed().as_millis(),
+                "Fetch phase completed"
+            );
+            courses
+        }
         Err(e) => {
-            error!("Failed to fetch courses: {:#}", e);
+            error!(
+                cycle_number = cycle_number,
+                error = %e,
+                fetch_duration_ms = fetch_start.elapsed().as_millis(),
+                "Fetch phase failed"
+            );
             return Err(e);
         }
     };
 
-    info!("Fetched {} courses", courses.len());
-
     // Sync with database
+    let sync_start = Instant::now();
     let sync_result = db.sync_courses(&courses)?;
+
+    info!(
+        cycle_number = cycle_number,
+        sync_duration_ms = sync_start.elapsed().as_millis(),
+        is_first_run = sync_result.is_first_run,
+        total_courses = sync_result.total_courses,
+        raw_added = sync_result.added.len(),
+        raw_removed = sync_result.removed.len(),
+        "Sync phase completed"
+    );
 
     if sync_result.is_first_run {
         info!(
-            "First run completed, database initialized with {} courses",
-            courses.len()
+            cycle_number = cycle_number,
+            courses_stored = courses.len(),
+            total_duration_ms = cycle_start.elapsed().as_millis(),
+            "First run completed - database initialized, no notifications sent"
         );
         return Ok(());
     }
 
     if !sync_result.has_changes() {
-        info!("No changes detected");
+        info!(
+            cycle_number = cycle_number,
+            total_courses = sync_result.total_courses,
+            total_duration_ms = cycle_start.elapsed().as_millis(),
+            "No changes detected"
+        );
         return Ok(());
     }
 
-    info!(
-        "Changes detected: {} added, {} removed",
-        sync_result.added.len(),
-        sync_result.removed.len()
+    debug!(
+        cycle_number = cycle_number,
+        added_courses = ?sync_result.added.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+        removed_courses = ?sync_result.removed.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+        "Raw changes before filtering"
     );
 
     // Apply filter
     let filtered_diff = filter_changes(&sync_result, filter);
 
     if filtered_diff.is_empty() {
-        info!("No changes match the filter criteria");
+        info!(
+            cycle_number = cycle_number,
+            filter = %filter.description(),
+            raw_added = sync_result.added.len(),
+            raw_removed = sync_result.removed.len(),
+            total_duration_ms = cycle_start.elapsed().as_millis(),
+            "No changes match filter criteria - no notifications sent"
+        );
         return Ok(());
     }
 
     info!(
-        "After filtering: {} added, {} removed",
-        filtered_diff.added.len(),
-        filtered_diff.removed.len()
+        cycle_number = cycle_number,
+        filtered_added = filtered_diff.added.len(),
+        filtered_removed = filtered_diff.removed.len(),
+        filter = %filter.description(),
+        "Changes passed filter - sending notifications"
     );
 
     // Send notifications
+    let notify_start = Instant::now();
     let results = notifiers.notify_all(&filtered_diff).await;
-    for (name, result) in results {
+
+    let mut success_count = 0;
+    let mut failure_count = 0;
+
+    for (name, result) in &results {
         match result {
-            Ok(_) => info!("Notifier '{}' succeeded", name),
-            Err(e) => warn!("Notifier '{}' failed: {:#}", name, e),
+            Ok(_) => {
+                success_count += 1;
+                info!(
+                    cycle_number = cycle_number,
+                    notifier = %name,
+                    added_count = filtered_diff.added.len(),
+                    removed_count = filtered_diff.removed.len(),
+                    "Notification sent successfully"
+                );
+            }
+            Err(e) => {
+                failure_count += 1;
+                warn!(
+                    cycle_number = cycle_number,
+                    notifier = %name,
+                    error = %e,
+                    "Notification failed"
+                );
+            }
         }
     }
+
+    info!(
+        cycle_number = cycle_number,
+        notify_duration_ms = notify_start.elapsed().as_millis(),
+        total_duration_ms = cycle_start.elapsed().as_millis(),
+        notifiers_success = success_count,
+        notifiers_failed = failure_count,
+        changes_added = filtered_diff.added.len(),
+        changes_removed = filtered_diff.removed.len(),
+        "Scrape cycle completed"
+    );
 
     Ok(())
 }

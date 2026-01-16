@@ -1,24 +1,68 @@
+use tracing::{debug, info, instrument};
+
 use crate::config::PointsFilter;
 use crate::db::SyncResult;
 use crate::models::{Course, ScrapeDiff};
 
 /// Filter sync results based on points criteria
+#[instrument(skip(result), fields(
+    input_added = result.added.len(),
+    input_removed = result.removed.len(),
+    filter = %filter.description()
+))]
 pub fn filter_changes(result: &SyncResult, filter: &PointsFilter) -> ScrapeDiff {
     let added: Vec<Course> = result
         .added
         .iter()
-        .filter(|c| filter.matches(c.points))
+        .filter(|c| {
+            let matches = filter.matches(c.points);
+            if !matches {
+                debug!(
+                    course_code = %c.code,
+                    points = c.points,
+                    filter = %filter.description(),
+                    "Added course filtered out"
+                );
+            }
+            matches
+        })
         .cloned()
         .collect();
 
     let removed: Vec<Course> = result
         .removed
         .iter()
-        .filter(|c| filter.matches(c.points))
+        .filter(|c| {
+            let matches = filter.matches(c.points);
+            if !matches {
+                debug!(
+                    course_code = %c.code,
+                    points = c.points,
+                    filter = %filter.description(),
+                    "Removed course filtered out"
+                );
+            }
+            matches
+        })
         .cloned()
         .collect();
 
-    ScrapeDiff::new(added, removed)
+    let diff = ScrapeDiff::new(added.clone(), removed.clone());
+
+    info!(
+        filter = %filter.description(),
+        input_added = result.added.len(),
+        input_removed = result.removed.len(),
+        output_added = diff.added.len(),
+        output_removed = diff.removed.len(),
+        filtered_out_added = result.added.len() - diff.added.len(),
+        filtered_out_removed = result.removed.len() - diff.removed.len(),
+        added_codes = ?added.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+        removed_codes = ?removed.iter().map(|c| format!("{}({:.1}pts)", c.code, c.points)).collect::<Vec<_>>(),
+        "Filter applied to changes"
+    );
+
+    diff
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Serialize;
-use tracing::{debug, info};
+use std::time::Instant;
+use tracing::{debug, info, instrument, warn};
 
 use super::Notifier;
 use crate::models::{Course, ScrapeDiff};
@@ -120,22 +121,44 @@ impl Notifier for EmailNotifier {
         "email"
     }
 
+    #[instrument(skip(self, diff), fields(
+        notifier = "email",
+        recipients = ?self.to,
+        added = diff.added.len(),
+        removed = diff.removed.len()
+    ))]
     async fn notify(&self, diff: &ScrapeDiff) -> Result<()> {
         if diff.is_empty() {
+            debug!("No changes to notify, skipping email");
             return Ok(());
         }
 
+        let start = Instant::now();
         let (subject, html) = self.build_email_content(diff);
         let recipients_str = self.to.join(", ");
 
-        debug!("Sending email from '{}' to [{}]", self.from, recipients_str);
+        info!(
+            from = %self.from,
+            to = %recipients_str,
+            recipient_count = self.to.len(),
+            subject = %subject,
+            html_size_bytes = html.len(),
+            added_courses = diff.added.len(),
+            removed_courses = diff.removed.len(),
+            "Preparing to send email"
+        );
 
         let email = ResendEmail {
             from: self.from.clone(),
             to: self.to.clone(),
-            subject,
+            subject: subject.clone(),
             html,
         };
+
+        debug!(
+            api_url = RESEND_API_URL,
+            "Sending request to Resend API"
+        );
 
         let response = self
             .client
@@ -148,8 +171,18 @@ impl Notifier for EmailNotifier {
             .context("Failed to send email request to Resend API")?;
 
         let status = response.status();
+        let status_code = status.as_u16();
+
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
+            warn!(
+                status_code = status_code,
+                error = %error_text,
+                from = %self.from,
+                to = %recipients_str,
+                duration_ms = start.elapsed().as_millis(),
+                "Resend API request failed"
+            );
             anyhow::bail!(
                 "Resend API error (HTTP {}): {}\n\
                  Check that your RESEND_API_KEY is valid and --email-from uses a verified domain.",
@@ -158,11 +191,21 @@ impl Notifier for EmailNotifier {
             );
         }
 
+        let response_body = response.text().await.unwrap_or_default();
+
         info!(
-            "Email sent successfully to {} recipient(s): {}",
-            self.to.len(),
-            recipients_str
+            status_code = status_code,
+            from = %self.from,
+            to = %recipients_str,
+            recipient_count = self.to.len(),
+            subject = %subject,
+            added_courses = diff.added.len(),
+            removed_courses = diff.removed.len(),
+            duration_ms = start.elapsed().as_millis(),
+            response = %response_body,
+            "Email sent successfully via Resend API"
         );
+
         Ok(())
     }
 }
