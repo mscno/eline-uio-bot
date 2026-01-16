@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use libsql::{Builder, Connection};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, instrument};
 
-use crate::models::{Course, CourseChange};
+use crate::models::Course;
 
 const SCHEMA_VERSION: i32 = 2;
 
@@ -301,120 +301,6 @@ impl Database {
         Ok(self.get_course_count().await? == 0)
     }
 
-    pub async fn upsert_course(&self, course: &Course, now: DateTime<Utc>) -> Result<bool> {
-        let now_str = now.to_rfc3339();
-
-        // Check if course exists
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM courses WHERE code = ?",
-                libsql::params![course.code.clone()],
-            )
-            .await?;
-
-        let exists = rows.next().await?.is_some();
-
-        if exists {
-            // Update existing course
-            self.conn
-                .execute(
-                    "UPDATE courses SET name = ?, points = ?, url = ?, faculty = ?, last_seen_at = ? WHERE code = ?",
-                    libsql::params![
-                        course.name.clone(),
-                        course.points as f64,
-                        course.url.clone(),
-                        course.faculty.clone(),
-                        now_str.clone(),
-                        course.code.clone(),
-                    ],
-                )
-                .await?;
-            Ok(false) // Not new
-        } else {
-            // Insert new course
-            self.conn
-                .execute(
-                    "INSERT INTO courses (code, name, points, url, faculty, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    libsql::params![
-                        course.code.clone(),
-                        course.name.clone(),
-                        course.points as f64,
-                        course.url.clone(),
-                        course.faculty.clone(),
-                        now_str.clone(),
-                        now_str.clone(),
-                    ],
-                )
-                .await?;
-            Ok(true) // New course
-        }
-    }
-
-    pub async fn remove_course(&self, code: &str) -> Result<Option<Course>> {
-        // Get course before removing
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT code, name, points, url, faculty FROM courses WHERE code = ?",
-                libsql::params![code.to_string()],
-            )
-            .await?;
-
-        let course = if let Some(row) = rows.next().await? {
-            Some(Course {
-                code: row.get::<String>(0)?,
-                name: row.get::<String>(1)?,
-                points: row.get::<f64>(2)? as f32,
-                url: row.get::<String>(3)?,
-                faculty: row.get::<String>(4)?,
-            })
-        } else {
-            None
-        };
-
-        if course.is_some() {
-            self.conn
-                .execute(
-                    "DELETE FROM courses WHERE code = ?",
-                    libsql::params![code.to_string()],
-                )
-                .await?;
-        }
-
-        Ok(course)
-    }
-
-    pub async fn log_change(&self, change: &CourseChange) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        let course = change.course();
-        let change_type = change.change_type();
-        let course_json = serde_json::to_string(course)?;
-
-        self.conn
-            .execute(
-                "INSERT INTO change_log (course_code, change_type, course_data, timestamp) VALUES (?, ?, ?, ?)",
-                libsql::params![
-                    course.code.clone(),
-                    change_type.to_string(),
-                    course_json,
-                    now.clone(),
-                ],
-            )
-            .await?;
-
-        info!(
-            course_code = %course.code,
-            course_name = %course.name,
-            points = course.points,
-            change_type = %change_type,
-            timestamp = %now,
-            "Change logged to database"
-        );
-
-        Ok(())
-    }
-
     /// Log a complete run with all delta information
     #[instrument(skip(self, run_log), fields(
         total_fetched = run_log.total_courses_fetched,
@@ -586,9 +472,10 @@ impl Database {
     #[instrument(skip(self, current_courses), fields(incoming_courses = current_courses.len()))]
     pub async fn sync_courses(&self, current_courses: &[Course]) -> Result<SyncResult> {
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         let is_first_run = self.is_first_run().await?;
 
-        // Get existing courses
+        // Get existing courses (single query)
         let existing = self.get_all_courses().await?;
         let existing_count = existing.len();
         let current_codes: std::collections::HashSet<_> =
@@ -603,53 +490,106 @@ impl Database {
             "Starting database sync"
         );
 
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        let mut updated_count = 0;
+        // Determine added and removed courses from sets (no DB calls)
+        let added_codes: Vec<_> = current_codes.difference(&existing_codes).cloned().collect();
+        let removed_codes: Vec<_> = existing_codes.difference(&current_codes).cloned().collect();
 
-        // Find new courses
-        for course in current_courses {
-            let is_new = self.upsert_course(course, now).await?;
-            if is_new {
-                if !is_first_run {
+        let mut added: Vec<Course> = Vec::new();
+        let mut removed: Vec<Course> = Vec::new();
+
+        // Collect added courses
+        if !is_first_run {
+            for course in current_courses {
+                if added_codes.contains(&course.code) {
                     debug!(
                         course_code = %course.code,
                         course_name = %course.name,
                         points = course.points,
-                        faculty = %course.faculty,
                         "New course detected"
                     );
                     added.push(course.clone());
-                    self.log_change(&CourseChange::Added(course.clone())).await?;
                 }
-            } else {
-                updated_count += 1;
             }
         }
 
-        // Find removed courses
-        let codes_to_remove: Vec<_> = existing_codes.difference(&current_codes).cloned().collect();
-        debug!(
-            courses_to_remove = codes_to_remove.len(),
-            codes = ?codes_to_remove,
-            "Checking for removed courses"
-        );
-
-        for code in codes_to_remove {
-            if let Some(course) = self.remove_course(&code).await? {
-                if !is_first_run {
+        // Collect removed courses
+        if !is_first_run {
+            for code in &removed_codes {
+                if let Some(course) = existing.get(code) {
                     debug!(
                         course_code = %course.code,
                         course_name = %course.name,
                         points = course.points,
-                        faculty = %course.faculty,
                         "Course removed from availability"
                     );
-                    self.log_change(&CourseChange::Removed(course.clone())).await?;
-                    removed.push(course);
+                    removed.push(course.clone());
                 }
             }
         }
+
+        // Build batch SQL for all upserts (single network round trip)
+        let mut batch_sql = String::new();
+        for course in current_courses {
+            // Use INSERT OR REPLACE to handle both insert and update cases
+            let sql = format!(
+                "INSERT OR REPLACE INTO courses (code, name, points, url, faculty, first_seen_at, last_seen_at) \
+                 VALUES ('{}', '{}', {}, '{}', '{}', \
+                 COALESCE((SELECT first_seen_at FROM courses WHERE code = '{}'), '{}'), '{}');\n",
+                escape_sql(&course.code),
+                escape_sql(&course.name),
+                course.points as f64,
+                escape_sql(&course.url),
+                escape_sql(&course.faculty),
+                escape_sql(&course.code),
+                now_str,
+                now_str
+            );
+            batch_sql.push_str(&sql);
+        }
+
+        // Delete removed courses
+        for code in &removed_codes {
+            batch_sql.push_str(&format!(
+                "DELETE FROM courses WHERE code = '{}';\n",
+                escape_sql(code)
+            ));
+        }
+
+        // Log changes (added)
+        if !is_first_run {
+            for course in &added {
+                let json = serde_json::to_string(course).unwrap_or_default();
+                batch_sql.push_str(&format!(
+                    "INSERT INTO change_log (timestamp, change_type, course_code, course_data) \
+                     VALUES ('{}', 'added', '{}', '{}');\n",
+                    now_str,
+                    escape_sql(&course.code),
+                    escape_sql(&json)
+                ));
+            }
+
+            // Log changes (removed)
+            for course in &removed {
+                let json = serde_json::to_string(course).unwrap_or_default();
+                batch_sql.push_str(&format!(
+                    "INSERT INTO change_log (timestamp, change_type, course_code, course_data) \
+                     VALUES ('{}', 'removed', '{}', '{}');\n",
+                    now_str,
+                    escape_sql(&course.code),
+                    escape_sql(&json)
+                ));
+            }
+        }
+
+        // Execute entire batch in one network round trip
+        if !batch_sql.is_empty() {
+            self.conn
+                .execute_batch(&batch_sql)
+                .await
+                .context("Failed to execute batch sync")?;
+        }
+
+        let updated_count = current_courses.len() - added.len();
 
         if is_first_run {
             info!(
@@ -677,6 +617,11 @@ impl Database {
             total_courses: current_courses.len(),
         })
     }
+}
+
+/// Escape single quotes for SQL string literals
+fn escape_sql(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 #[derive(Debug)]

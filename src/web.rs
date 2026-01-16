@@ -6,23 +6,41 @@ use axum::{
     routing::get,
     Router,
 };
+use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::info;
 
 use crate::db::{CourseDisplay, Database, RunLogEntry};
 
+/// Display-safe application configuration (no secrets)
+#[derive(Clone)]
+pub struct AppConfig {
+    pub email_enabled: bool,
+    pub email_from: Option<String>,
+    pub email_to: Vec<String>,
+    pub sms_enabled: bool,
+    pub sms_from: Option<String>,
+    pub sms_to: Vec<String>,
+    pub points_filter: String,
+    pub database_type: String,
+    pub scrape_url: String,
+}
+
 /// Application state shared between handlers
 pub struct AppState {
     pub db: Database,
+    pub config: AppConfig,
 }
 
 /// Create the Axum router with all routes
-pub fn create_router(db: Database) -> Router {
-    let state = Arc::new(AppState { db });
+pub fn create_router(db: Database, config: AppConfig) -> Router {
+    let state = Arc::new(AppState { db, config });
 
     Router::new()
         .route("/", get(dashboard))
         .route("/runs", get(run_logs))
         .route("/runs/{id}", get(run_detail))
+        .route("/config", get(config_page))
+        .layer(ValidateRequestHeaderLayer::basic("admin", "forktree"))
         .with_state(state)
 }
 
@@ -63,6 +81,11 @@ async fn run_detail(
         Ok(None) => Html(render_error("Run log not found")),
         Err(e) => Html(render_error(&format!("Error: {}", e))),
     }
+}
+
+/// Configuration page
+async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(render_config(&state.config))
 }
 
 /// Render the dashboard HTML
@@ -363,6 +386,124 @@ fn render_run_detail(run: &RunLogEntry) -> String {
         added_list,
         run.raw_removed_count,
         removed_list,
+    )
+}
+
+/// Render the configuration page HTML
+fn render_config(config: &AppConfig) -> String {
+    let email_status = if config.email_enabled {
+        "<span class=\"badge badge-success\">Enabled</span>"
+    } else {
+        "<span class=\"badge badge-disabled\">Disabled</span>"
+    };
+
+    let sms_status = if config.sms_enabled {
+        "<span class=\"badge badge-success\">Enabled</span>"
+    } else {
+        "<span class=\"badge badge-disabled\">Disabled</span>"
+    };
+
+    let email_from = config.email_from.as_deref().unwrap_or("Not configured");
+    let email_to = if config.email_to.is_empty() {
+        "Not configured".to_string()
+    } else {
+        config.email_to.join(", ")
+    };
+
+    let sms_from = config.sms_from.as_deref().unwrap_or("Not configured");
+    let sms_to = if config.sms_to.is_empty() {
+        "Not configured".to_string()
+    } else {
+        config.sms_to.join(", ")
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configuration - UiOBot</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/milligram/1.4.1/milligram.min.css">
+    <style>
+        body {{ padding: 2rem 0; }}
+        nav {{ margin-bottom: 2rem; }}
+        nav a {{ margin-right: 1rem; }}
+        .config-grid {{ display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 2rem; max-width: 600px; }}
+        .config-grid dt {{ font-weight: bold; color: #606c76; }}
+        .config-grid dd {{ margin: 0; }}
+        .badge {{ display: inline-block; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.9rem; }}
+        .badge-success {{ background: #d4edda; color: #155724; }}
+        .badge-disabled {{ background: #f5f5f5; color: #606c76; }}
+        .section {{ margin-bottom: 2rem; }}
+        .section h3 {{ border-bottom: 1px solid #ddd; padding-bottom: 0.5rem; }}
+    </style>
+</head>
+<body>
+    <main class="container">
+        <h1>UiOBot Dashboard</h1>
+        <nav>
+            <a href="/" class="button button-clear">Courses</a>
+            <a href="/runs" class="button button-clear">Run Logs</a>
+            <a href="/config" class="button button-outline">Configuration</a>
+        </nav>
+
+        <h2>System Configuration</h2>
+
+        <div class="section">
+            <h3>Scraping</h3>
+            <dl class="config-grid">
+                <dt>Source URL</dt>
+                <dd><a href="{}" target="_blank">{}</a></dd>
+
+                <dt>Points Filter</dt>
+                <dd>{}</dd>
+
+                <dt>Database</dt>
+                <dd>{}</dd>
+            </dl>
+        </div>
+
+        <div class="section">
+            <h3>Email Notifications</h3>
+            <dl class="config-grid">
+                <dt>Status</dt>
+                <dd>{}</dd>
+
+                <dt>From</dt>
+                <dd>{}</dd>
+
+                <dt>To</dt>
+                <dd>{}</dd>
+            </dl>
+        </div>
+
+        <div class="section">
+            <h3>SMS Notifications</h3>
+            <dl class="config-grid">
+                <dt>Status</dt>
+                <dd>{}</dd>
+
+                <dt>From</dt>
+                <dd>{}</dd>
+
+                <dt>To</dt>
+                <dd>{}</dd>
+            </dl>
+        </div>
+    </main>
+</body>
+</html>"#,
+        html_escape(&config.scrape_url),
+        html_escape(&config.scrape_url),
+        html_escape(&config.points_filter),
+        html_escape(&config.database_type),
+        email_status,
+        html_escape(email_from),
+        html_escape(&email_to),
+        sms_status,
+        html_escape(sms_from),
+        html_escape(&sms_to),
     )
 }
 

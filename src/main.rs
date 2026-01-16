@@ -21,6 +21,7 @@ use db::{Database, RunLog};
 use diff::filter_changes;
 use models::{Course, ScrapeDiff};
 use notifier::{ConsoleNotifier, EmailNotifier, Notifier, NotifierChain, SmsNotifier};
+use web::AppConfig;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -95,8 +96,25 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     let notifiers = build_notifiers(&config)?;
     let port = config.port;
 
+    // Build display-safe config for web UI
+    let app_config = AppConfig {
+        email_enabled: config.email_enabled(),
+        email_from: config.email_from.clone(),
+        email_to: config.email_recipients(),
+        sms_enabled: config.sms_enabled(),
+        sms_from: config.sms_from.clone(),
+        sms_to: config.sms_recipients(),
+        points_filter: filter.description(),
+        database_type: if config.uses_turso() {
+            "Turso (remote)".to_string()
+        } else {
+            "SQLite (local)".to_string()
+        },
+        scrape_url: config.url.clone(),
+    };
+
     // Start web server in background
-    let web_router = web::create_router(db);
+    let web_router = web::create_router(db, app_config);
     tokio::spawn(async move {
         if let Err(e) = web::start_server(web_router, port).await {
             error!(error = %e, "Web server failed");

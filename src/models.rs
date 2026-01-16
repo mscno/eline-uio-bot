@@ -21,27 +21,6 @@ impl Course {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum CourseChange {
-    Added(Course),
-    Removed(Course),
-}
-
-impl CourseChange {
-    pub fn course(&self) -> &Course {
-        match self {
-            CourseChange::Added(c) | CourseChange::Removed(c) => c,
-        }
-    }
-
-    pub fn change_type(&self) -> &'static str {
-        match self {
-            CourseChange::Added(_) => "added",
-            CourseChange::Removed(_) => "removed",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ScrapeDiff {
     pub added: Vec<Course>,
