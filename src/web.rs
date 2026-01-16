@@ -217,7 +217,15 @@ fn render_run_detail(run: &RunLogEntry) -> String {
     } else {
         run.added_courses
             .iter()
-            .map(|c| format!("<li>{}</li>", html_escape(c)))
+            .map(|c| {
+                format!(
+                    r#"<li><a href="{}" target="_blank">{}</a> - {} ({} pts)</li>"#,
+                    html_escape(&c.url),
+                    html_escape(&c.code),
+                    html_escape(&c.name),
+                    c.points
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -227,7 +235,15 @@ fn render_run_detail(run: &RunLogEntry) -> String {
     } else {
         run.removed_courses
             .iter()
-            .map(|c| format!("<li>{}</li>", html_escape(c)))
+            .map(|c| {
+                format!(
+                    r#"<li><a href="{}" target="_blank">{}</a> - {} ({} pts)</li>"#,
+                    html_escape(&c.url),
+                    html_escape(&c.code),
+                    html_escape(&c.name),
+                    c.points
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };

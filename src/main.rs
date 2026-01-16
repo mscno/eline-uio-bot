@@ -463,8 +463,8 @@ async fn run_scrape_cycle(
         filter_used: filter.description(),
         notification_sent,
         is_first_run: sync_result.is_first_run,
-        added_courses: filtered_diff.added.iter().map(|c| c.code.clone()).collect(),
-        removed_courses: filtered_diff.removed.iter().map(|c| c.code.clone()).collect(),
+        added_courses: filtered_diff.added.clone(),
+        removed_courses: filtered_diff.removed.clone(),
         duration_ms: cycle_start.elapsed().as_millis() as u64,
     };
 

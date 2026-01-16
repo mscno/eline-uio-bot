@@ -472,8 +472,8 @@ impl Database {
             filter = %run_log.filter_used,
             notification_sent = run_log.notification_sent,
             is_first_run = run_log.is_first_run,
-            added_codes = ?run_log.added_courses,
-            removed_codes = ?run_log.removed_courses,
+            added_codes = ?run_log.added_courses.iter().map(|c| &c.code).collect::<Vec<_>>(),
+            removed_codes = ?run_log.removed_courses.iter().map(|c| &c.code).collect::<Vec<_>>(),
             duration_ms = run_log.duration_ms,
             "Run logged to database"
         );
@@ -704,8 +704,8 @@ pub struct RunLog {
     pub filter_used: String,
     pub notification_sent: bool,
     pub is_first_run: bool,
-    pub added_courses: Vec<String>,  // Course codes
-    pub removed_courses: Vec<String>, // Course codes
+    pub added_courses: Vec<Course>,
+    pub removed_courses: Vec<Course>,
     pub duration_ms: u64,
 }
 
@@ -734,8 +734,8 @@ pub struct RunLogEntry {
     pub filter_used: String,
     pub notification_sent: bool,
     pub is_first_run: bool,
-    pub added_courses: Vec<String>,
-    pub removed_courses: Vec<String>,
+    pub added_courses: Vec<Course>,
+    pub removed_courses: Vec<Course>,
     pub duration_ms: i64,
 }
 
