@@ -1,8 +1,10 @@
 mod console;
 mod email;
+mod sms;
 
 pub use console::ConsoleNotifier;
 pub use email::EmailNotifier;
+pub use sms::SmsNotifier;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -37,10 +39,6 @@ impl NotifierChain {
 
     pub fn len(&self) -> usize {
         self.notifiers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.notifiers.is_empty()
     }
 
     #[instrument(skip(self, diff), fields(

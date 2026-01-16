@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,13 +21,6 @@ impl Course {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredCourse {
-    pub course: Course,
-    pub first_seen_at: DateTime<Utc>,
-    pub last_seen_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone)]
 pub enum CourseChange {
     Added(Course),
@@ -40,10 +32,6 @@ impl CourseChange {
         match self {
             CourseChange::Added(c) | CourseChange::Removed(c) => c,
         }
-    }
-
-    pub fn is_added(&self) -> bool {
-        matches!(self, CourseChange::Added(_))
     }
 
     pub fn change_type(&self) -> &'static str {

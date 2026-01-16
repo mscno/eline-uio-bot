@@ -20,7 +20,7 @@ use course_scraper::CourseScraper;
 use db::{Database, RunLog};
 use diff::filter_changes;
 use models::{Course, ScrapeDiff};
-use notifier::{ConsoleNotifier, EmailNotifier, Notifier, NotifierChain};
+use notifier::{ConsoleNotifier, EmailNotifier, Notifier, NotifierChain, SmsNotifier};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,6 +33,7 @@ async fn main() -> ExitCode {
         Command::Check { config } => run_check(config).await,
         Command::Start { config, interval } => run_start(config, interval).await,
         Command::TestEmail { to, from } => run_test_email(to, from).await,
+        Command::TestSms { to, from } => run_test_sms(to, from).await,
     };
 
     match result {
@@ -195,6 +196,103 @@ async fn run_test_email(to: String, from: String) -> Result<()> {
     Ok(())
 }
 
+async fn run_test_sms(to: String, from: String) -> Result<()> {
+    use config::{normalize_norwegian_phone, normalize_twilio_phone};
+
+    // Initialize minimal logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    // Get Twilio credentials from environment
+    let account_sid = env::var("TWILIO_ACCOUNT_SID").context(
+        "TWILIO_ACCOUNT_SID environment variable not set.\n\
+         Get credentials from https://twilio.com/console and set it in your .env file.",
+    )?;
+
+    let auth_token = env::var("TWILIO_AUTH_TOKEN").context(
+        "TWILIO_AUTH_TOKEN environment variable not set.\n\
+         Get credentials from https://twilio.com/console and set it in your .env file.",
+    )?;
+
+    // Validate and normalize phone numbers
+    let from_normalized = normalize_twilio_phone(&from).context(format!(
+        "Invalid Twilio phone number for --from: '{}'\n\
+         Expected format: +1XXXXXXXXXX (U.S.) or +47XXXXXXXX (Norwegian)",
+        from
+    ))?;
+
+    let recipients: Vec<String> = to
+        .split(',')
+        .filter_map(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match normalize_norwegian_phone(trimmed) {
+                Some(normalized) => Some(normalized),
+                None => {
+                    warn!(
+                        phone = %trimmed,
+                        "Skipping invalid Norwegian phone number"
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if recipients.is_empty() {
+        anyhow::bail!(
+            "No valid Norwegian phone numbers provided in --to: '{}'\n\
+             Expected format: +4712345678, 4712345678, or 12345678 (8 digits)",
+            to
+        );
+    }
+
+    info!(
+        from = %from_normalized,
+        to = ?recipients,
+        "Sending test SMS notification"
+    );
+
+    // Create sample courses for demo
+    let demo_diff = ScrapeDiff::new(
+        vec![
+            Course::new(
+                "TEST1000".to_string(),
+                "Introduction to Test Notifications".to_string(),
+                2.5,
+                "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+                "Test Faculty".to_string(),
+            ),
+            Course::new(
+                "TEST2000".to_string(),
+                "Advanced SMS Testing".to_string(),
+                5.0,
+                "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+                "Test Faculty".to_string(),
+            ),
+        ],
+        vec![Course::new(
+            "OLD1000".to_string(),
+            "Previously Available Course".to_string(),
+            10.0,
+            "https://www.uio.no/studier/emner/ledige-plasser/".to_string(),
+            "Test Faculty".to_string(),
+        )],
+    );
+
+    // Send the test SMS
+    let notifier = SmsNotifier::new(account_sid, auth_token, from_normalized, recipients);
+    notifier.notify(&demo_diff).await?;
+
+    info!("Test SMS sent successfully!");
+    Ok(())
+}
+
 /// Open database based on configuration (local SQLite or Turso)
 async fn open_database(config: &Config) -> Result<Database> {
     if let Some(ref db_url) = config.database_url {
@@ -299,6 +397,43 @@ fn build_notifiers(config: &Config) -> Result<NotifierChain> {
         );
 
         notifiers.add(EmailNotifier::new(api_key, from, recipients));
+    }
+
+    // Add SMS notifier if configured
+    if config.sms_enabled() {
+        let account_sid = env::var("TWILIO_ACCOUNT_SID").context(
+            "TWILIO_ACCOUNT_SID environment variable not set.\n\
+             To enable SMS notifications:\n\
+             1. Get credentials from https://twilio.com/console\n\
+             2. Add TWILIO_ACCOUNT_SID=ACxxxxx to your .env file\n\
+             3. Or export TWILIO_ACCOUNT_SID=ACxxxxx in your shell",
+        )?;
+
+        let auth_token = env::var("TWILIO_AUTH_TOKEN").context(
+            "TWILIO_AUTH_TOKEN environment variable not set.\n\
+             To enable SMS notifications:\n\
+             1. Get credentials from https://twilio.com/console\n\
+             2. Add TWILIO_AUTH_TOKEN=your-token to your .env file\n\
+             3. Or export TWILIO_AUTH_TOKEN=your-token in your shell",
+        )?;
+
+        let from = config
+            .sms_from
+            .clone()
+            .context("TWILIO_FROM_NUMBER is required when using SMS notifications")?;
+
+        let recipients = config.sms_recipients();
+
+        info!(
+            notifier = "sms",
+            from = %from,
+            recipients = ?recipients,
+            recipient_count = recipients.len(),
+            account_sid_prefix = %account_sid.chars().take(10).collect::<String>(),
+            "Added SMS notifier"
+        );
+
+        notifiers.add(SmsNotifier::new(account_sid, auth_token, from, recipients));
     }
 
     info!(

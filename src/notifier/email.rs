@@ -29,7 +29,7 @@ impl EmailNotifier {
 
     fn build_email_content(&self, diff: &ScrapeDiff) -> (String, String) {
         let subject = format!(
-            "UiO Course Alert: {} new, {} removed",
+            "UiO Emnevarsel: {} nye, {} fjernet",
             diff.added.len(),
             diff.removed.len()
         );
@@ -50,10 +50,10 @@ impl EmailNotifier {
         "#);
         html.push_str("</style></head><body>");
 
-        html.push_str("<h1>UiO Course Availability Changes</h1>");
+        html.push_str("<h1>Endringer i ledige plasser ved UiO</h1>");
 
         if !diff.added.is_empty() {
-            html.push_str(&format!("<h2>New Courses Available ({})</h2>", diff.added.len()));
+            html.push_str(&format!("<h2>Nye ledige plasser ({})</h2>", diff.added.len()));
             for course in &diff.added {
                 html.push_str(&format_course_html(course, false));
             }
@@ -61,7 +61,7 @@ impl EmailNotifier {
 
         if !diff.removed.is_empty() {
             html.push_str(&format!(
-                "<h2>Courses No Longer Available ({})</h2>",
+                "<h2>Ikke lenger ledige plasser ({})</h2>",
                 diff.removed.len()
             ));
             for course in &diff.removed {
@@ -70,8 +70,8 @@ impl EmailNotifier {
         }
 
         html.push_str(r#"<div class="footer">"#);
-        html.push_str("This notification was sent by UiOBot - Course Availability Monitor.<br>");
-        html.push_str(r#"<a href="https://www.uio.no/studier/emner/ledige-plasser/">View all available courses</a>"#);
+        html.push_str("Denne varslingen ble sendt av UiOBot - Overvåker ledige plasser.<br>");
+        html.push_str(r#"<a href="https://www.uio.no/studier/emner/ledige-plasser/">Se alle emner med ledige plasser</a>"#);
         html.push_str("</div>");
         html.push_str("</body></html>");
 
@@ -100,7 +100,7 @@ fn format_course_html(course: &Course, is_removed: bool) -> String {
         course.name
     ));
     html.push_str(&format!(
-        r#"<div class="course-meta">{} points | {}</div>"#,
+        r#"<div class="course-meta">{} studiepoeng | {}</div>"#,
         course.points, course.faculty
     ));
     html.push_str("</div>");

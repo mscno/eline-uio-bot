@@ -39,6 +39,16 @@ pub enum Command {
         #[arg(short, long, env = "UIOBOT_EMAIL_FROM", required = true)]
         from: String,
     },
+    /// Send a test SMS notification to verify Twilio configuration
+    TestSms {
+        /// Phone numbers to send to (comma-separated Norwegian numbers)
+        #[arg(short, long, env = "UIOBOT_SMS_TO", required = true)]
+        to: String,
+
+        /// Twilio phone number to send SMS from
+        #[arg(short, long, env = "TWILIO_FROM_NUMBER", required = true)]
+        from: String,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -94,6 +104,15 @@ pub struct Config {
     /// Web server port (only used in start mode)
     #[arg(long, env = "UIOBOT_PORT", default_value = "3000")]
     pub port: u16,
+
+    /// SMS phone numbers to send notifications to (comma-separated Norwegian numbers)
+    /// Example: --sms-to "+4712345678,+4787654321"
+    #[arg(long, env = "UIOBOT_SMS_TO", value_name = "PHONES")]
+    pub sms_to: Option<String>,
+
+    /// Twilio phone number to send SMS from
+    #[arg(long, env = "TWILIO_FROM_NUMBER")]
+    pub sms_from: Option<String>,
 }
 
 impl Cli {
@@ -124,6 +143,23 @@ impl Config {
     /// Check if using Turso/remote database
     pub fn uses_turso(&self) -> bool {
         self.database_url.is_some()
+    }
+
+    /// Parse the comma-separated sms_to string into a list of normalized phone numbers
+    pub fn sms_recipients(&self) -> Vec<String> {
+        self.sms_to
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|p| normalize_norwegian_phone(p.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Check if SMS notifications are enabled
+    pub fn sms_enabled(&self) -> bool {
+        self.sms_to.is_some() && !self.sms_recipients().is_empty()
     }
 
     /// Validate the configuration and return errors if invalid
@@ -205,6 +241,43 @@ impl Config {
                         "Invalid email address in --email-from: '{}'\n\
                          Expected format: \"Name <email@domain.com>\" or \"email@domain.com\"",
                         from
+                    );
+                }
+            }
+        }
+
+        // Validate SMS configuration
+        if self.sms_enabled() {
+            // Validate sms_from is set
+            if self.sms_from.is_none() {
+                bail!(
+                    "SMS notifications require --sms-from to be set.\n\
+                     Set it via CLI flag or TWILIO_FROM_NUMBER environment variable.\n\
+                     Example: --sms-from \"+4712345678\""
+                );
+            }
+
+            // Validate from number is a valid Twilio phone number (U.S. or Norwegian)
+            if let Some(ref from) = self.sms_from {
+                if normalize_twilio_phone(from).is_none() {
+                    bail!(
+                        "Invalid Twilio phone number in --sms-from: '{}'\n\
+                         Expected format: +1XXXXXXXXXX (U.S.) or +47XXXXXXXX (Norwegian)",
+                        from
+                    );
+                }
+            }
+
+            // Validate recipient numbers (invalid ones are filtered out, but warn if none are valid)
+            if let Some(ref sms_to) = self.sms_to {
+                let raw_numbers: Vec<&str> = sms_to.split(',').map(|s| s.trim()).collect();
+                let valid_numbers = self.sms_recipients();
+
+                if valid_numbers.is_empty() && !raw_numbers.is_empty() {
+                    bail!(
+                        "No valid Norwegian phone numbers in --sms-to: '{}'\n\
+                         Expected format: +4712345678, 4712345678, or 12345678 (8 digits)",
+                        sms_to
                     );
                 }
             }
@@ -352,6 +425,92 @@ fn extract_email_from_address(address: &str) -> String {
     address.to_string()
 }
 
+/// Normalize a Twilio phone number (U.S. or Norwegian)
+/// U.S. format: +1XXXXXXXXXX (10 digits after +1)
+/// Norwegian format: +47XXXXXXXX (8 digits after +47)
+/// Returns None if invalid
+pub fn normalize_twilio_phone(phone: &str) -> Option<String> {
+    // Remove all whitespace and dashes
+    let cleaned: String = phone.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+
+    // Must start with + for Twilio numbers
+    if !cleaned.starts_with('+') {
+        return None;
+    }
+
+    let digits = &cleaned[1..];
+
+    // Must be all digits after +
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // U.S. number: +1 followed by 10 digits
+    if digits.starts_with('1') && digits.len() == 11 {
+        return Some(cleaned);
+    }
+
+    // Norwegian number: +47 followed by 8 digits
+    if digits.starts_with("47") && digits.len() == 10 {
+        let local = &digits[2..];
+        let first_digit = local.chars().next()?;
+        if matches!(first_digit, '2'..='9') {
+            return Some(cleaned);
+        }
+    }
+
+    None
+}
+
+/// Normalize a Norwegian phone number to +47XXXXXXXX format
+/// Accepts: +4712345678, 4712345678, 12345678
+/// Returns None if invalid
+pub fn normalize_norwegian_phone(phone: &str) -> Option<String> {
+    // Remove all whitespace and dashes
+    let cleaned: String = phone.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+
+    // Extract digits and optional leading +
+    let (has_plus, digits): (bool, String) = if cleaned.starts_with('+') {
+        (true, cleaned[1..].to_string())
+    } else {
+        (false, cleaned)
+    };
+
+    // Must be all digits after optional +
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // Determine the 8-digit number
+    let eight_digits = if has_plus && digits.starts_with("47") && digits.len() == 10 {
+        // +4712345678 format
+        digits[2..].to_string()
+    } else if !has_plus && digits.starts_with("47") && digits.len() == 10 {
+        // 4712345678 format
+        digits[2..].to_string()
+    } else if digits.len() == 8 {
+        // 12345678 format (just 8 digits)
+        digits
+    } else {
+        return None;
+    };
+
+    // Validate it's exactly 8 digits
+    if eight_digits.len() != 8 || !eight_digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // Norwegian mobile numbers start with 4 or 9
+    // Norwegian landline numbers start with 2, 3, 5, 6, 7
+    // All valid Norwegian numbers are 8 digits
+    let first_digit = eight_digits.chars().next()?;
+    if !matches!(first_digit, '2'..='9') {
+        return None;
+    }
+
+    Some(format!("+47{}", eight_digits))
+}
+
 /// Validate the interval for the start command
 pub fn validate_interval(interval: u64) -> Result<()> {
     if interval < 10 {
@@ -445,6 +604,8 @@ mod tests {
             email_to: Some("a@b.com, c@d.com, e@f.com".to_string()),
             email_from: None,
             port: 3000,
+            sms_to: None,
+            sms_from: None,
         };
 
         let recipients = config.email_recipients();
@@ -528,9 +689,67 @@ mod tests {
             email_to: None,
             email_from: None,
             port: 3000,
+            sms_to: None,
+            sms_from: None,
         };
 
         let filter = config.points_filter();
         assert!(matches!(filter, PointsFilter::Exact(v) if (v - 2.5).abs() < 0.01));
+    }
+
+    #[test]
+    fn test_normalize_norwegian_phone() {
+        // Valid formats (using numbers starting with 4 - mobile, or 2 - Oslo landline)
+        assert_eq!(normalize_norwegian_phone("+4741234567"), Some("+4741234567".to_string()));
+        assert_eq!(normalize_norwegian_phone("4741234567"), Some("+4741234567".to_string()));
+        assert_eq!(normalize_norwegian_phone("41234567"), Some("+4741234567".to_string()));
+        assert_eq!(normalize_norwegian_phone("+47 412 34 567"), Some("+4741234567".to_string()));
+        assert_eq!(normalize_norwegian_phone("412-34-567"), Some("+4741234567".to_string()));
+
+        // Valid first digits (2-9)
+        assert_eq!(normalize_norwegian_phone("22345678"), Some("+4722345678".to_string()));
+        assert_eq!(normalize_norwegian_phone("92345678"), Some("+4792345678".to_string()));
+        assert_eq!(normalize_norwegian_phone("45678901"), Some("+4745678901".to_string()));
+
+        // Invalid: wrong length
+        assert_eq!(normalize_norwegian_phone("4234567"), None); // 7 digits
+        assert_eq!(normalize_norwegian_phone("423456789"), None); // 9 digits
+        assert_eq!(normalize_norwegian_phone("+474234567"), None); // +47 + 7 digits
+
+        // Invalid: starts with 0 or 1
+        assert_eq!(normalize_norwegian_phone("01234567"), None);
+        assert_eq!(normalize_norwegian_phone("11234567"), None);
+
+        // Invalid: non-Norwegian country code
+        assert_eq!(normalize_norwegian_phone("+1234567890"), None);
+        assert_eq!(normalize_norwegian_phone("+4641234567"), None);
+
+        // Invalid: contains letters
+        assert_eq!(normalize_norwegian_phone("+47412abc78"), None);
+    }
+
+    #[test]
+    fn test_normalize_twilio_phone() {
+        // Valid U.S. numbers
+        assert_eq!(normalize_twilio_phone("+12025551234"), Some("+12025551234".to_string()));
+        assert_eq!(normalize_twilio_phone("+1 202 555 1234"), Some("+12025551234".to_string()));
+        assert_eq!(normalize_twilio_phone("+1-202-555-1234"), Some("+12025551234".to_string()));
+
+        // Valid Norwegian numbers
+        assert_eq!(normalize_twilio_phone("+4741234567"), Some("+4741234567".to_string()));
+        assert_eq!(normalize_twilio_phone("+47 412 34 567"), Some("+4741234567".to_string()));
+
+        // Invalid: missing + prefix
+        assert_eq!(normalize_twilio_phone("12025551234"), None);
+        assert_eq!(normalize_twilio_phone("4741234567"), None);
+
+        // Invalid: wrong length
+        assert_eq!(normalize_twilio_phone("+1202555123"), None); // U.S. too short
+        assert_eq!(normalize_twilio_phone("+120255512345"), None); // U.S. too long
+        assert_eq!(normalize_twilio_phone("+474123456"), None); // Norwegian too short
+
+        // Invalid: other country codes
+        assert_eq!(normalize_twilio_phone("+442071234567"), None); // UK
+        assert_eq!(normalize_twilio_phone("+33123456789"), None); // France
     }
 }

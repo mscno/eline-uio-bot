@@ -94,6 +94,7 @@ impl Database {
     }
 
     /// Open an in-memory database for testing
+    #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self> {
         debug!("Opening in-memory database");
 
@@ -486,7 +487,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT code, name, points, url, faculty, first_seen_at, last_seen_at
+                "SELECT code, name, points, url, faculty, first_seen_at
                  FROM courses ORDER BY code",
                 (),
             )
@@ -501,7 +502,6 @@ impl Database {
                 url: row.get::<String>(3)?,
                 faculty: row.get::<String>(4)?,
                 first_seen_at: row.get::<String>(5)?,
-                last_seen_at: row.get::<String>(6)?,
             });
         }
 
@@ -718,7 +718,6 @@ pub struct CourseDisplay {
     pub faculty: String,
     pub url: String,
     pub first_seen_at: String,
-    pub last_seen_at: String,
 }
 
 /// Run log entry for web display
