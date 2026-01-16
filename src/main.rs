@@ -588,7 +588,7 @@ async fn run_scrape_cycle(
         }
     }
 
-    // Log this run to the database
+    // Log this run to the database (store RAW courses so users can see what changed)
     let run_log = RunLog {
         total_courses_fetched: courses.len(),
         raw_added_count: sync_result.added.len(),
@@ -598,8 +598,8 @@ async fn run_scrape_cycle(
         filter_used: filter.description(),
         notification_sent,
         is_first_run: sync_result.is_first_run,
-        added_courses: filtered_diff.added.clone(),
-        removed_courses: filtered_diff.removed.clone(),
+        added_courses: sync_result.added.clone(),
+        removed_courses: sync_result.removed.clone(),
         duration_ms: cycle_start.elapsed().as_millis() as u64,
     };
 

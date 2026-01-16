@@ -138,15 +138,28 @@ fn render_run_logs(runs: &[RunLogEntry]) -> String {
     let mut rows = String::new();
     for run in runs {
         let notified = if run.notification_sent { "Yes" } else { "No" };
-        let first_run = if run.is_first_run { " (first run)" } else { "" };
+        let first_run = if run.is_first_run { " (first)" } else { "" };
+
+        // Show raw changes, with filtered in parentheses if different
+        let added_display = if run.raw_added_count == run.filtered_added_count {
+            format!("+{}", run.raw_added_count)
+        } else {
+            format!("+{} ({})", run.raw_added_count, run.filtered_added_count)
+        };
+
+        let removed_display = if run.raw_removed_count == run.filtered_removed_count {
+            format!("-{}", run.raw_removed_count)
+        } else {
+            format!("-{} ({})", run.raw_removed_count, run.filtered_removed_count)
+        };
 
         rows.push_str(&format!(
             r#"<tr>
                 <td><a href="/runs/{}">{}</a></td>
                 <td>{}</td>
                 <td>{}</td>
-                <td style="color: green;">+{}</td>
-                <td style="color: red;">-{}</td>
+                <td style="color: green;">{}</td>
+                <td style="color: red;">{}</td>
                 <td>{}</td>
                 <td>{}ms</td>
             </tr>"#,
@@ -154,8 +167,8 @@ fn render_run_logs(runs: &[RunLogEntry]) -> String {
             run.id,
             format_timestamp(&run.timestamp),
             run.total_courses_fetched,
-            run.filtered_added_count,
-            run.filtered_removed_count,
+            added_display,
+            removed_display,
             format!("{}{}", notified, first_run),
             run.duration_ms,
         ));
@@ -175,6 +188,7 @@ fn render_run_logs(runs: &[RunLogEntry]) -> String {
         nav a {{ margin-right: 1rem; }}
         table {{ width: 100%; }}
         .count {{ color: #606c76; font-weight: normal; }}
+        .hint {{ color: #606c76; font-size: 0.85em; margin-bottom: 1rem; }}
     </style>
 </head>
 <body>
@@ -186,6 +200,7 @@ fn render_run_logs(runs: &[RunLogEntry]) -> String {
         </nav>
 
         <h2>Run Logs <span class="count">({} shown)</span></h2>
+        <p class="hint">Added/Removed show raw changes. Numbers in parentheses show filtered changes (what triggers notifications).</p>
         <table>
             <thead>
                 <tr>
