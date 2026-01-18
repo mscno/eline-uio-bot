@@ -60,7 +60,7 @@ async fn run_check(config: Config) -> Result<()> {
     log_config(&config);
 
     let scraper = CourseScraper::new(config.url.clone());
-    let db = open_database(&config).await?;
+    let mut db = open_database(&config).await?;
     let filter = config.points_filter();
     let notifiers = build_notifiers(&config)?;
 
@@ -69,7 +69,7 @@ async fn run_check(config: Config) -> Result<()> {
         "Configuration loaded, starting check"
     );
 
-    run_scrape_cycle(&scraper, &db, &filter, &notifiers).await
+    run_scrape_cycle(&scraper, &mut db, &filter, &notifiers).await
 }
 
 async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
@@ -122,7 +122,7 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
     });
 
     // Re-open database for scrape loop (web server took ownership)
-    let db = open_database(&config).await?;
+    let mut db = open_database(&config).await?;
 
     let mut ticker = interval(Duration::from_secs(interval_secs));
 
@@ -139,11 +139,38 @@ async fn run_start(config: Config, interval_secs: u64) -> Result<()> {
 
         debug!("Ticker fired, starting new cycle");
 
-        if let Err(e) = run_scrape_cycle(&scraper, &db, &filter, &notifiers).await {
-            error!(
-                error = %e,
-                "Scrape cycle failed - will retry next interval"
-            );
+        if let Err(e) = run_scrape_cycle(&scraper, &mut db, &filter, &notifiers).await {
+            // Check if this is a Turso connection error that can be recovered
+            if Database::is_connection_error(&e) {
+                warn!(
+                    error = %e,
+                    "Turso connection error detected - attempting reconnection"
+                );
+
+                match db.reconnect().await {
+                    Ok(_) => {
+                        info!("Reconnection successful - retrying scrape cycle");
+                        // Retry immediately after reconnection
+                        if let Err(retry_err) = run_scrape_cycle(&scraper, &mut db, &filter, &notifiers).await {
+                            error!(
+                                error = %retry_err,
+                                "Scrape cycle failed after reconnection - will retry next interval"
+                            );
+                        }
+                    }
+                    Err(reconnect_err) => {
+                        error!(
+                            error = %reconnect_err,
+                            "Failed to reconnect to Turso - will retry next interval"
+                        );
+                    }
+                }
+            } else {
+                error!(
+                    error = %e,
+                    "Scrape cycle failed - will retry next interval"
+                );
+            }
         }
     }
 }
@@ -464,7 +491,7 @@ fn build_notifiers(config: &Config) -> Result<NotifierChain> {
 
 async fn run_scrape_cycle(
     scraper: &CourseScraper,
-    db: &Database,
+    db: &mut Database,
     filter: &PointsFilter,
     notifiers: &NotifierChain,
 ) -> Result<()> {

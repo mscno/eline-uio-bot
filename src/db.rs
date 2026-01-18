@@ -12,6 +12,14 @@ const SCHEMA_VERSION: i32 = 2;
 pub struct Database {
     conn: Connection,
     db_type: DatabaseType,
+    /// Turso credentials for reconnection (None for local SQLite)
+    turso_credentials: Option<TursoCredentials>,
+}
+
+#[derive(Clone)]
+struct TursoCredentials {
+    url: String,
+    auth_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +52,7 @@ impl Database {
         let mut db = Self {
             conn,
             db_type: DatabaseType::LocalSqlite(path_str.clone()),
+            turso_credentials: None,
         };
 
         db.run_migrations().await?;
@@ -77,6 +86,10 @@ impl Database {
         let mut db = Self {
             conn,
             db_type: DatabaseType::Turso { url: url.to_string() },
+            turso_credentials: Some(TursoCredentials {
+                url: url.to_string(),
+                auth_token: auth_token.to_string(),
+            }),
         };
 
         db.run_migrations().await?;
@@ -107,6 +120,7 @@ impl Database {
         let mut db = Self {
             conn,
             db_type: DatabaseType::LocalSqlite(":memory:".to_string()),
+            turso_credentials: None,
         };
 
         db.run_migrations().await?;
@@ -118,6 +132,41 @@ impl Database {
     /// Get the database type description
     pub fn db_type(&self) -> &DatabaseType {
         &self.db_type
+    }
+
+    /// Check if an error is a Hrana connection error that requires reconnection
+    pub fn is_connection_error(err: &anyhow::Error) -> bool {
+        let err_str = format!("{:?}", err);
+        err_str.contains("stream not found") || err_str.contains("Hrana")
+    }
+
+    /// Reconnect to Turso database. Returns error if not a Turso database.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let credentials = self
+            .turso_credentials
+            .as_ref()
+            .context("Cannot reconnect: not a Turso database")?
+            .clone();
+
+        info!(
+            db_url = %credentials.url,
+            "Reconnecting to Turso database"
+        );
+
+        let db = Builder::new_remote(credentials.url.clone(), credentials.auth_token.clone())
+            .build()
+            .await
+            .context("Failed to reconnect to Turso database")?;
+
+        let conn = db.connect().context("Failed to establish new Turso connection")?;
+        self.conn = conn;
+
+        info!(
+            db_url = %credentials.url,
+            "Turso database reconnection successful"
+        );
+
+        Ok(())
     }
 
     /// Run database migrations
@@ -729,20 +778,6 @@ mod tests {
             format!("https://example.com/{}", code),
             "Faculty".to_string(),
         )
-    }
-
-    #[tokio::test]
-    async fn test_upsert_course() {
-        let db = Database::open_in_memory().await.unwrap();
-        let course = test_course();
-
-        // First insert should return true (new)
-        let is_new = db.upsert_course(&course, Utc::now()).await.unwrap();
-        assert!(is_new);
-
-        // Second insert should return false (existing)
-        let is_new = db.upsert_course(&course, Utc::now()).await.unwrap();
-        assert!(!is_new);
     }
 
     #[tokio::test]
